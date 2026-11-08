@@ -5,7 +5,9 @@ explicit timeouts, idempotency enforcement, and credit ledger accounting.
 """
 from __future__ import annotations
 
+import os
 import random
+import sys
 import time
 from typing import Any, Generator
 
@@ -198,12 +200,17 @@ class SimClient:
     def request_approval(self, body: dict[str, Any]) -> dict[str, Any]:
         """Submits a proposal to the human approver via POST /approvals."""
         pid = body.get("proposal_id")
-        return self._request(
+        res = self._request(
             "POST",
             "/approvals",
             json_body=body,
             idempotency_key=pid,
         ).json()
+        if os.environ.get("TEST_CRASH_ON_SUBMIT") == "1":
+            os.environ["TEST_CRASH_ON_SUBMIT"] = "0"
+            print("\n[TEST CRASH] Process killed immediately between submit and recording...", file=sys.stderr)
+            import os as _os; _os._exit(42)
+        return res
 
     def list_approvals(
         self,
@@ -222,11 +229,16 @@ class SimClient:
 
     def apply_approval(self, wid: str, approval_id: str) -> dict[str, Any]:
         """Applies an approved proposal via POST /workflows/{wid}/apply."""
-        return self._request(
+        res = self._request(
             "POST",
             f"/workflows/{wid}/apply",
             json_body={"approval_id": approval_id},
         ).json()
+        if os.environ.get("TEST_CRASH_ON_APPLY") == "1":
+            os.environ["TEST_CRASH_ON_APPLY"] = "0"
+            print("\n[TEST CRASH] Process killed immediately between apply and recording...", file=sys.stderr)
+            import os as _os; _os._exit(43)
+        return res
 
     def auto_apply(self, wid: str, body: dict[str, Any]) -> dict[str, Any]:
         """Applies configuration directly via PUT /workflows/{wid}/config (if policy allows)."""

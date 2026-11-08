@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import sys
 from collections import defaultdict
 from typing import Any, Callable
 
@@ -178,6 +180,11 @@ class IngestPipeline:
             sim_ts=sim_ts or dt.datetime.now().isoformat(),
             prune_day_before=prune_day,
         )
+
+        if os.environ.get("TEST_CRASH_ON_INGEST") == "1":
+            os.environ["TEST_CRASH_ON_INGEST"] = "0"
+            print("\n[TEST CRASH] Process killed mid-ingest after committing chunk...", file=sys.stderr)
+            import os as _os; _os._exit(41)
 
         return {
             "events": len(new_event_ids),

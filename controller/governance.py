@@ -191,6 +191,7 @@ class GovernanceEngine:
     ) -> str | None:
         """Executes proposal submission via either auto-apply or /approvals with full crash safety."""
         wid = workflow_spec["workflow_id"]
+        gov = (workflow_spec or {}).get("governance", {})
         old_cfg = self.api.get_config(wid)["config"]
         diff = compute_config_diff(old_cfg, proposed_config)
         if not diff:

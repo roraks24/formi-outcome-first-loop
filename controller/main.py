@@ -161,11 +161,51 @@ class Controller:
                     match = next((a for a in approvals if a.get("proposal_id") == key), None)
                     if match:
                         self.store.mark_intent_executed(key, state["ts"], match)
+                        aid = match.get("approval_id")
+                        payload = json.loads(row["payload_json"])
+                        diff = payload.get("diff", {})
+                        affected = payload.get("affected_leads", 0)
+                        dry_run = payload.get("dry_run", {})
+                        impact = payload.get("impact_score", 0.0)
+                        rationale = payload.get("rationale", "")
+                        summary = payload.get("change_summary", "")
+                        base_ver = payload.get("base_version", 1)
+                        ttl_hours = payload.get("expires_in_hours", 24)
+                        evidence = payload.get("evidence")
+                        with self.store.transaction() as cur:
+                            cur.execute(
+                                """
+                                INSERT OR IGNORE INTO proposals (
+                                    proposal_id, approval_id, workflow_id, base_version,
+                                    status, change_summary, diff_json, affected_leads,
+                                    dry_run_json, impact_score, rationale, evidence_json,
+                                    is_auto_apply, created_minute, decided_minute, expires_minute
+                                ) VALUES (?, ?, ?, ?, 'SUBMITTED', ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?);
+                                """,
+                                (
+                                    key, aid, wid, base_ver, summary,
+                                    json.dumps(diff), affected, json.dumps(dry_run),
+                                    impact, rationale, json.dumps(evidence) if evidence else None,
+                                    state["sim_minute"], state["sim_minute"] + int(ttl_hours * 60),
+                                ),
+                            )
                     else:
                         self.store.mark_intent_failed(key, state["ts"], "not_found_on_sim")
                 elif action == "apply_approval":
                     cfg = self.api.get_config(wid)
                     self.store.mark_intent_executed(key, state["ts"], cfg)
+                    payload = json.loads(row["payload_json"])
+                    aid = payload.get("approval_id")
+                    new_ver = cfg.get("version")
+                    with self.store.transaction() as cur:
+                        cur.execute(
+                            """
+                            UPDATE proposals
+                            SET status = 'APPLIED', applied_minute = ?, applied_version = ?
+                            WHERE approval_id = ?;
+                            """,
+                            (state["sim_minute"], new_ver, aid),
+                        )
 
         # 3. Ingest prior event chunks
         ingest_stats = self.ingest.ingest_available_chunks(kind="events", sim_ts=state["ts"])
