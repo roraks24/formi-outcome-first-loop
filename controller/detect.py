@@ -231,7 +231,11 @@ class AnomalyDetector:
         sim_day: int,
         active_config: dict[str, Any],
     ) -> list[Detection]:
-        """Detects if prompt hallucination rate spikes beyond safe baseline (1%)."""
+        """Detects if prompt hallucination rate spikes beyond empirical baseline."""
+        # Burn-in discipline: Day 0 establishes workflow baseline
+        if sim_day < 1:
+            return []
+
         cur = self.store._conn.cursor()
         # Query hallucination counts for current prompt in trailing 24 hours
         prompt_ver = active_config.get("prompt_version")
@@ -276,13 +280,13 @@ class AnomalyDetector:
         base_conn = int((base_row and base_row["base_conn"]) or 0)
         base_halluc = int((base_row and base_row["base_halluc"]) or 0)
 
-        # Baseline rate p_base directly observed from data (or conservative fallback if cold-starting)
+        # Baseline rate p_base directly observed from data (or empirical reference if cold-starting)
         if base_conn >= 50:
-            p_base = max(0.001, base_halluc / base_conn)
+            p_base = max(0.005, base_halluc / base_conn)
             k1_pool = base_halluc
             n1_pool = base_conn
         else:
-            p_base = 0.005
+            p_base = 0.014
             k1_pool = int(conn * p_base)
             n1_pool = conn
 
