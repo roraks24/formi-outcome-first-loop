@@ -199,7 +199,21 @@ MIGRATIONS: list[str] = [
         policy_clause TEXT NOT NULL,
         outcome TEXT NOT NULL
     );
+    """,
+    # Migration 2: Promoted variants tracking for decay detection and rollback
     """
+    CREATE TABLE IF NOT EXISTS promoted_variants (
+        workflow_id TEXT NOT NULL,
+        cohort_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        winning_arm TEXT NOT NULL,
+        holdout_arm TEXT NOT NULL,
+        promoted_minute INTEGER NOT NULL,
+        promoted_rate REAL NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE, ROLLED_BACK
+        PRIMARY KEY (workflow_id, cohort_id, dim)
+    );
+    """,
 ]
 
 
@@ -600,4 +614,60 @@ class Store:
                     policy_clause,
                     outcome,
                 ),
+            )
+
+    # --------------------------------------------------------------------------
+    # Promoted Variants & Decay Tracking (C7)
+    # --------------------------------------------------------------------------
+
+    def record_promoted_variant(
+        self,
+        workflow_id: str,
+        cohort_id: str,
+        dim: str,
+        winning_arm: str,
+        holdout_arm: str,
+        promoted_minute: int,
+        promoted_rate: float,
+    ) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO promoted_variants (
+                    workflow_id, cohort_id, dim, winning_arm, holdout_arm,
+                    promoted_minute, promoted_rate, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE');
+                """,
+                (
+                    workflow_id, cohort_id, dim, winning_arm, holdout_arm,
+                    promoted_minute, promoted_rate,
+                ),
+            )
+
+    def get_active_promoted_variants(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
+        cur = self._conn.cursor()
+        query = "SELECT * FROM promoted_variants WHERE status = 'ACTIVE'"
+        params: list[Any] = []
+        if workflow_id:
+            query += " AND workflow_id = ?"
+            params.append(workflow_id)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def mark_promoted_variant_rolled_back(
+        self,
+        workflow_id: str,
+        cohort_id: str,
+        dim: str,
+    ) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE promoted_variants
+                SET status = 'ROLLED_BACK'
+                WHERE workflow_id = ? AND cohort_id = ? AND dim = ?;
+                """,
+                (workflow_id, cohort_id, dim),
             )

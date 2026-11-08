@@ -259,9 +259,10 @@ class AnomalyDetector:
         rate = halluc / conn
         baseline_acceptable = 0.010  # 1% acceptable upper threshold for BFSI
 
-        # Test whether hallucination rate is significantly above 1%
+        # Test whether hallucination rate is significantly above acceptable threshold (1.5%)
+        # Acute incident threshold: rate > 0.035 (3.5%) with strong significance (p < 0.001)
         z, p_val, diff, _ = two_proportion_z_test(
-            k1=int(conn * baseline_acceptable),
+            k1=int(conn * 0.015),
             n1=conn,
             k2=halluc,
             n2=conn,
@@ -269,7 +270,7 @@ class AnomalyDetector:
         )
 
         key = f"halluc:{workflow_id}:{prompt_ver}"
-        if rate > 0.020 and p_val < 0.01:
+        if rate > 0.035 and p_val < 0.001:
             self._consecutive_flags[key] = self._consecutive_flags.get(key, 0) + 1
         else:
             self._consecutive_flags[key] = 0

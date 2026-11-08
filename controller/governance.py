@@ -1,0 +1,442 @@
+"""Governance engine managing proposal lifecycles, approver timing, fatigue, and auto-apply.
+
+State Machine:
+  DRAFT -> SUBMITTED -> (APPROVED | REJECTED | EXPIRED | LAPSED | STALE) -> APPLIED -> (VERIFIED | ROLLED_BACK)
+
+Enforces:
+  1. Write-ahead intents before calling API endpoints (crash-safety & idempotency).
+  2. Approver fatigue protection (throttles to <= 2 requests / 24h per workflow).
+  3. Working hours synchronization (submits between 11:00 and 17:00 IST to respect standups).
+  4. Stale-base detection & safe re-proposal.
+  5. Policy-permitted auto-apply with total-variation shift checking.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from .api import AutoApplyNotPermittedError, SimApiError, SimClient, StaleBaseVersionError
+from .store import Store
+
+
+def total_variation_shift(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> float:
+    """Calculates maximum total-variation distance across all cohort allocations."""
+    keys = {"default"}
+    for c in old_cfg.get("cohorts", []) + new_cfg.get("cohorts", []):
+        keys.add(c["id"])
+
+    worst = 0.0
+    dims = ("welcome_message", "voice", "caller_id")
+
+    for k in keys:
+        for d in dims:
+            old_dist = (old_cfg.get("allocations", {}).get(k) or {}).get(d) or old_cfg.get("allocations", {}).get("default", {}).get(d, {})
+            new_dist = (new_cfg.get("allocations", {}).get(k) or {}).get(d) or new_cfg.get("allocations", {}).get("default", {}).get(d, {})
+            all_opts = set(old_dist) | set(new_dist)
+            tv = 0.5 * sum(abs(old_dist.get(o, 0.0) - new_dist.get(o, 0.0)) for o in all_opts)
+            worst = max(worst, tv)
+    return worst
+
+
+def compute_config_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Generates structured diff between old and new configuration."""
+    diff: dict[str, Any] = {}
+    if old_cfg.get("prompt_version") != new_cfg.get("prompt_version"):
+        diff["prompt_version"] = {
+            "old": old_cfg.get("prompt_version"),
+            "new": new_cfg.get("prompt_version"),
+        }
+
+    for cohort_key in set(old_cfg.get("allocations", {})) | set(new_cfg.get("allocations", {})):
+        old_alloc = old_cfg.get("allocations", {}).get(cohort_key, {})
+        new_alloc = new_cfg.get("allocations", {}).get(cohort_key, {})
+        for dim in ("welcome_message", "voice", "caller_id"):
+            if old_alloc.get(dim) != new_alloc.get(dim):
+                diff[f"allocations.{cohort_key}.{dim}"] = {
+                    "old": old_alloc.get(dim),
+                    "new": new_alloc.get(dim),
+                }
+
+    if old_cfg.get("schedule") != new_cfg.get("schedule"):
+        diff["schedule"] = {"status": "updated"}
+
+    return diff
+
+
+class GovernanceEngine:
+    """Manages policy compliance, proposal submission, approvals, and application."""
+
+    def __init__(self, api: SimClient, store: Store):
+        self.api = api
+        self.store = store
+
+    def can_auto_apply(
+        self,
+        workflow_spec: dict[str, Any],
+        old_cfg: dict[str, Any],
+        new_cfg: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Validates if proposed configuration qualifies for policy-permitted auto-apply."""
+        gov = workflow_spec.get("governance", {})
+        auto_pol = gov.get("auto_apply", {})
+        if not auto_pol.get("enabled", False):
+            return False, "auto_apply_disabled"
+
+        allowed_dims = set(auto_pol.get("allowed_dims", []))
+        max_shift = float(auto_pol.get("max_shift", 0.0))
+
+        # Check modified dimensions
+        diff = compute_config_diff(old_cfg, new_cfg)
+        if not diff:
+            return False, "no_change"
+
+        for key in diff:
+            if key.startswith("allocations."):
+                dim = key.split(".")[-1]
+                if dim not in allowed_dims:
+                    return False, f"dimension_{dim}_not_in_allowed_dims"
+            elif key == "prompt_version" and "prompt_version" not in allowed_dims:
+                return False, "prompt_version_not_in_allowed_dims"
+            elif key == "schedule" and "schedule" not in allowed_dims:
+                return False, "schedule_not_in_allowed_dims"
+
+        # Check shift
+        shift = total_variation_shift(old_cfg, new_cfg)
+        if shift > max_shift + 1e-6:
+            return False, f"shift_{shift:.3f}_exceeds_max_{max_shift:.3f}"
+
+        return True, "permitted"
+
+    def has_pending_proposal(self, workflow_id: str, dim: str | None = None) -> bool:
+        """Checks if there is an active SUBMITTED/PENDING proposal for this workflow."""
+        cur = self.store._conn.cursor()
+        if dim:
+            cur.execute(
+                """
+                SELECT change_summary, diff_json FROM proposals
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');
+                """,
+                (workflow_id,),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            for r in rows:
+                diff_str = str(r["diff_json"] or "")
+                summary_str = str(r["change_summary"] or "")
+                if dim in diff_str or dim in summary_str:
+                    return True
+            return False
+        else:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM proposals
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');
+                """,
+                (workflow_id,),
+            )
+            row = cur.fetchone()
+            cur.close()
+            return bool(row and row["cnt"] > 0)
+
+    def is_within_approver_hours(
+        self,
+        workflow_spec: dict[str, Any],
+        current_hour: int,
+    ) -> bool:
+        """Checks if current time is within approver hours and outside morning standups (11:00-17:00)."""
+        gov = workflow_spec.get("governance", {})
+        hours = gov.get("approver_hours", [10, 19])
+        # Respect Anita Desai's standups (no proposals before 11:00)
+        effective_start = max(hours[0], 11)
+        effective_end = min(hours[1], 18)
+        return effective_start <= current_hour < effective_end
+
+    def is_approver_fatigued(
+        self,
+        workflow_id: str,
+        sim_minute: int,
+        max_requests_per_24h: int = 2,
+    ) -> bool:
+        """Throttles requests to max_requests_per_24h per 24-hour window to protect approver attention."""
+        cur = self.store._conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM proposals
+            WHERE workflow_id = ? AND is_auto_apply = 0 AND created_minute >= ?;
+            """,
+            (workflow_id, sim_minute - 1440),
+        )
+        row = cur.fetchone()
+        cur.close()
+        count = int(row["cnt"] or 0)
+        return count >= max_requests_per_24h
+
+    def submit_proposal(
+        self,
+        workflow_spec: dict[str, Any],
+        base_version: int,
+        proposed_config: dict[str, Any],
+        change_summary: str,
+        rationale: str,
+        affected_leads: int,
+        impact_score: float,
+        dry_run: dict[str, Any],
+        sim_minute: int,
+        sim_ts: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Executes proposal submission via either auto-apply or /approvals with full crash safety."""
+        wid = workflow_spec["workflow_id"]
+        old_cfg = self.api.get_config(wid)["config"]
+        diff = compute_config_diff(old_cfg, proposed_config)
+        if not diff:
+            # No changes to propose or apply
+            return None
+
+        # 1. Determine if proposal can be auto-applied
+        can_auto, auto_reason = self.can_auto_apply(workflow_spec, old_cfg, proposed_config)
+
+        if can_auto:
+            auto_prop_id = f"auto_{uuid.uuid4().hex[:12]}"
+            # Auto-apply path
+            body = {
+                "proposal_id": auto_prop_id,
+                "base_version": base_version,
+                "proposed_config": proposed_config,
+                "rationale": rationale,
+            }
+            if evidence:
+                body["evidence"] = evidence
+
+            # Write-ahead intent before dispatching API call
+            self.store.record_intent(
+                intent_id=f"int_{auto_prop_id}",
+                idempotency_key=auto_prop_id,
+                action="auto_apply",
+                workflow_id=wid,
+                payload=body,
+                sim_ts=sim_ts,
+            )
+
+            try:
+                res = self.api.auto_apply(wid, body)
+                new_ver = res.get("version", base_version + 1)
+                self.store.mark_intent_executed(auto_prop_id, sim_ts, res)
+
+                # Record proposal state
+                with self.store.transaction() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO proposals (
+                            proposal_id, approval_id, workflow_id, base_version,
+                            status, change_summary, diff_json, affected_leads,
+                            dry_run_json, impact_score, rationale, evidence_json,
+                            is_auto_apply, created_minute, decided_minute, expires_minute,
+                            applied_minute, applied_version
+                        ) VALUES (?, NULL, ?, ?, 'APPLIED', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            auto_prop_id, wid, base_version, change_summary,
+                            json.dumps(diff), affected_leads, json.dumps(dry_run),
+                            impact_score, rationale, json.dumps(evidence) if evidence else None,
+                            sim_minute, sim_minute, sim_minute + 1440, sim_minute, new_ver,
+                        ),
+                    )
+
+                self.store.record_decision(
+                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    sim_minute=sim_minute,
+                    ts=sim_ts,
+                    workflow_id=wid,
+                    decision_type="AUTO_APPLY",
+                    inputs_ref={"proposal_id": auto_prop_id},
+                    numbers={"impact_score": impact_score, "affected_leads": affected_leads},
+                    policy_clause=f"auto_apply_permitted:{auto_reason}",
+                    outcome=f"auto_applied_v{new_ver}",
+                )
+                return auto_prop_id
+
+            except StaleBaseVersionError:
+                self.store.mark_intent_failed(auto_prop_id, sim_ts, "stale_base_version")
+                return None
+            except AutoApplyNotPermittedError as e:
+                self.store.mark_intent_failed(auto_prop_id, sim_ts, f"auto_apply_forbidden: {e.detail}")
+                # Fall through to approval path below with fresh proposal id
+
+        # 2. Human Approval Path
+        current_hour = (sim_minute % 1440) // 60
+        if not self.is_within_approver_hours(workflow_spec, current_hour):
+            # Defer submission until approver is online
+            return None
+
+        gov = workflow_spec.get("governance", {})
+        max_req = int(gov.get("max_requests_per_24h", 2))
+        is_incident = impact_score >= 0.70
+        if not is_incident and self.is_approver_fatigued(wid, sim_minute, max_requests_per_24h=max_req):
+            # Throttle to avoid fatigue rejection
+            return None
+
+        ttl_hours = min(float(gov.get("proposal_ttl_hours", 24)), 24.0)
+        appr_proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
+
+        body = {
+            "proposal_id": appr_proposal_id,
+            "workflow_id": wid,
+            "base_version": base_version,
+            "proposed_config": proposed_config,
+            "change_summary": change_summary,
+            "diff": diff,
+            "affected_leads": int(affected_leads),
+            "dry_run": dry_run,
+            "impact_score": float(round(impact_score, 4)),
+            "rationale": rationale,
+            "expires_in_hours": ttl_hours,
+        }
+        if evidence:
+            body["evidence"] = evidence
+
+        # Write-ahead intent
+        self.store.record_intent(
+            intent_id=f"int_{appr_proposal_id}",
+            idempotency_key=appr_proposal_id,
+            action="request_approval",
+            workflow_id=wid,
+            payload=body,
+            sim_ts=sim_ts,
+        )
+
+        try:
+            res = self.api.request_approval(body)
+            aid = res.get("approval_id")
+            self.store.mark_intent_executed(appr_proposal_id, sim_ts, res)
+
+            with self.store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO proposals (
+                        proposal_id, approval_id, workflow_id, base_version,
+                        status, change_summary, diff_json, affected_leads,
+                        dry_run_json, impact_score, rationale, evidence_json,
+                        is_auto_apply, created_minute, decided_minute, expires_minute
+                    ) VALUES (?, ?, ?, ?, 'SUBMITTED', ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?);
+                    """,
+                    (
+                        appr_proposal_id, aid, wid, base_version, change_summary,
+                        json.dumps(diff), affected_leads, json.dumps(dry_run),
+                        impact_score, rationale, json.dumps(evidence) if evidence else None,
+                        sim_minute, sim_minute + int(ttl_hours * 60),
+                    ),
+                )
+
+            self.store.record_decision(
+                decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                sim_minute=sim_minute,
+                ts=sim_ts,
+                workflow_id=wid,
+                decision_type="PROPOSAL_SUBMITTED",
+                inputs_ref={"proposal_id": appr_proposal_id, "approval_id": aid},
+                numbers={"impact_score": impact_score, "affected_leads": affected_leads},
+                policy_clause="governance.approvals",
+                outcome=f"submitted_approval_{aid}",
+            )
+            return appr_proposal_id
+
+        except StaleBaseVersionError:
+            self.store.mark_intent_failed(appr_proposal_id, sim_ts, "stale_base_version")
+            return None
+        except SimApiError as e:
+            self.store.mark_intent_failed(appr_proposal_id, sim_ts, f"approval_error: {e.detail}")
+            return None
+
+    def reconcile_and_apply_approved(
+        self,
+        sim_minute: int,
+        sim_ts: str,
+    ) -> int:
+        """Polls approved proposals and applies them within their apply window."""
+        approvals = self.api.list_approvals(status="approved")
+        applied_count = 0
+
+        for ap in approvals:
+            aid = ap["approval_id"]
+            wid = ap["workflow_id"]
+            base_ver = ap["base_version"]
+            pid = ap.get("proposal_id", "")
+
+            # Check if live config is still on base_version
+            cur_cfg = self.api.get_config(wid)
+            if cur_cfg["version"] != base_ver:
+                # Check if we already recorded this proposal as STALE locally
+                cur = self.store._conn.cursor()
+                cur.execute("SELECT status FROM proposals WHERE approval_id = ?;", (aid,))
+                row = cur.fetchone()
+                cur.close()
+                if row and row["status"] in ("STALE", "APPLIED", "LAPSED", "EXPIRED"):
+                    continue
+
+                # Live config shifted (e.g. supervisor edit); mark proposal STALE
+                with self.store.transaction() as cur:
+                    cur.execute("UPDATE proposals SET status = 'STALE' WHERE approval_id = ?;", (aid,))
+                self.store.record_decision(
+                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    sim_minute=sim_minute,
+                    ts=sim_ts,
+                    workflow_id=wid,
+                    decision_type="STALE_BASE_DETECTED",
+                    inputs_ref={"approval_id": aid, "proposal_id": pid},
+                    numbers={"base_version": base_ver, "live_version": cur_cfg["version"]},
+                    policy_clause="stale_base_handling",
+                    outcome="marked_stale_skipped_apply",
+                )
+                continue
+
+            # Apply approval
+            intent_key = f"apply_{aid}_{uuid.uuid4().hex[:6]}"
+            self.store.record_intent(
+                intent_id=f"int_{intent_key}",
+                idempotency_key=intent_key,
+                action="apply_approval",
+                workflow_id=wid,
+                payload={"approval_id": aid},
+                sim_ts=sim_ts,
+            )
+
+            try:
+                res = self.api.apply_approval(wid, aid)
+                new_ver = res.get("version")
+                self.store.mark_intent_executed(intent_key, sim_ts, res)
+
+                with self.store.transaction() as cur:
+                    cur.execute(
+                        """
+                        UPDATE proposals
+                        SET status = 'APPLIED', applied_minute = ?, applied_version = ?
+                        WHERE approval_id = ?;
+                        """,
+                        (sim_minute, new_ver, aid),
+                    )
+
+                self.store.record_decision(
+                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    sim_minute=sim_minute,
+                    ts=sim_ts,
+                    workflow_id=wid,
+                    decision_type="APPROVAL_APPLIED",
+                    inputs_ref={"approval_id": aid, "proposal_id": pid},
+                    numbers={"new_version": new_ver},
+                    policy_clause="governance.apply",
+                    outcome=f"applied_version_v{new_ver}",
+                )
+                applied_count += 1
+
+            except StaleBaseVersionError:
+                self.store.mark_intent_failed(intent_key, sim_ts, "stale_base_version")
+                with self.store.transaction() as cur:
+                    cur.execute("UPDATE proposals SET status = 'STALE' WHERE approval_id = ?;", (aid,))
+            except SimApiError as e:
+                self.store.mark_intent_failed(intent_key, sim_ts, str(e.detail))
+
+        return applied_count

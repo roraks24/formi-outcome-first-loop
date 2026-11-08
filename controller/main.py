@@ -1,11 +1,12 @@
-"""Controller main entry point and runtime loop.
+"""Outcome-First Agent Loop Controller main orchestration loop.
 
-Orchestrates clock advancement, streaming ingestion, startup crash recovery,
-and structured per-tick logging.
+Coordinates clock advancement, streaming ingestion, anomaly detection,
+governance approvals, and statistical experimentation.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import time
@@ -13,15 +14,18 @@ from pathlib import Path
 from typing import Any
 
 from .api import SimApiError, SimClient, SimulatorFinishedError
+from .detect import AnomalyDetector
+from .experiments import ExperimentManager
+from .governance import GovernanceEngine
+from .incidents import IncidentHandler
 from .ingest import IngestPipeline
 from .store import Store
 
 
 def get_process_rss_mb() -> float:
-    """Returns the process RSS in megabytes on Linux or Windows without extra dependencies."""
+    """Returns process RSS in MB on Linux or Windows without extra dependencies."""
     try:
         import resource
-        # On Linux, ru_maxrss is in kilobytes
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
     except ImportError:
         pass
@@ -59,7 +63,7 @@ def get_process_rss_mb() -> float:
 
 
 class Controller:
-    """Main loop orchestrator managing ingestion, recovery, and advancement."""
+    """Always-on controller driving the simulator over HTTP."""
 
     def __init__(
         self,
@@ -71,15 +75,22 @@ class Controller:
         self.tick_minutes = tick_minutes
         self.store = Store(db_path)
         self.api = SimClient(base_url=sim_url, store=self.store)
+        self.governance = GovernanceEngine(api=self.api, store=self.store)
+        self.detector = AnomalyDetector(store=self.store)
+        self.experiments = ExperimentManager(store=self.store, governance=self.governance)
+        self.incidents = IncidentHandler(governance=self.governance, store=self.store)
+
         self.ingest = IngestPipeline(
             api=self.api,
             store=self.store,
             on_config_changed=self._handle_config_changed,
             on_approval_decided=self._handle_approval_decided,
         )
+
         self.running = True
         self.total_events = 0
-        self.open_proposals_count = 0
+        self.workflow_specs: dict[str, dict[str, Any]] = {}
+        self.supervisor_edited_dims: dict[str, set[str]] = {}
         self._setup_signals()
 
     def _setup_signals(self) -> None:
@@ -94,14 +105,19 @@ class Controller:
         wid = ev.get("workflow_id", "")
         ver = int(ev.get("version", 1))
         actor = ev.get("actor", "")
-        minute = 0  # Will be reconciled from sim state if needed
-        # Save snapshot
+        minute = 0
         cfg = self.api.get_config(wid).get("config", {})
         self.store.save_config_snapshot(wid, ver, actor, minute, cfg)
 
+        # Invalidate active experiments if supervisor altered configuration
+        if actor == "supervisor":
+            changed_dims = ev.get("changed_dims", [])
+            self.supervisor_edited_dims.setdefault(wid, set()).update(changed_dims)
+            print(f"[SUPERVISOR] Detected supervisor edit on {wid} (v{ver}, dims={changed_dims}). Invalidating experiments.", file=sys.stderr)
+            self.experiments.invalidate_for_workflow(wid, "supervisor_edit", minute)
+
     def _handle_approval_decided(self, ev: dict[str, Any]) -> None:
         aid = ev.get("approval_id", "")
-        wid = ev.get("workflow_id", "")
         status = ev.get("status", "")
         reasons = ev.get("reasons", [])
         with self.store.transaction() as cur:
@@ -115,14 +131,14 @@ class Controller:
             )
 
     def recover(self) -> None:
-        """Runs startup reconciliation before starting the control loop."""
+        """Startup crash reconciliation before starting control loop."""
         print("[RECOVER] Reconciling state with simulator...", file=sys.stderr)
         state = self.api.get_state()
         wfs = self.api.get_workflows()
+        self.workflow_specs = {w["workflow_id"]: w for w in wfs}
 
-        # 1. Snapshot latest configurations for all workflows
-        for w in wfs:
-            wid = w["workflow_id"]
+        # 1. Snapshot latest configurations
+        for wid, w in self.workflow_specs.items():
             cfg_resp = self.api.get_config(wid)
             self.store.save_config_snapshot(
                 workflow_id=wid,
@@ -149,14 +165,9 @@ class Controller:
                         self.store.mark_intent_failed(key, state["ts"], "not_found_on_sim")
                 elif action == "apply_approval":
                     cfg = self.api.get_config(wid)
-                    # Check if applied
                     self.store.mark_intent_executed(key, state["ts"], cfg)
 
-        # 3. Synchronize open proposals count
-        approvals = self.api.list_approvals(status="pending")
-        self.open_proposals_count = len(approvals)
-
-        # 4. Ingest any pending chunks already produced by simulator
+        # 3. Ingest prior event chunks
         ingest_stats = self.ingest.ingest_available_chunks(kind="events", sim_ts=state["ts"])
         self.total_events += ingest_stats["events"]
         print(
@@ -166,13 +177,12 @@ class Controller:
         )
 
     def run(self) -> None:
-        """Main execution loop: advances simulation, ingests chunks, logs telemetry."""
+        """Main execution loop advancing simulation, ingesting, and governing."""
         self.recover()
 
         while self.running:
             t0 = time.perf_counter()
             try:
-                # Advance simulation by tick_minutes
                 adv = self.api.advance(minutes=self.tick_minutes)
             except SimulatorFinishedError:
                 print("\n[LOOP] Simulation completed cleanly (409 finished).", file=sys.stderr)
@@ -183,14 +193,80 @@ class Controller:
 
             sim_ts = adv["ts"]
             sim_min = adv["sim_minute"]
+            sim_day = sim_min // 1440
+            current_hour = (sim_min % 1440) // 60
             finished = adv.get("finished", False)
 
-            # Ingest new event chunks produced by the advance step
+            # 1. Ingestion
             ingest_stats = self.ingest.ingest_available_chunks(kind="events", sim_ts=sim_ts)
             dt_s = max(time.perf_counter() - t0, 1e-6)
             tick_events = ingest_stats["events"]
             self.total_events += tick_events
             events_per_sec = tick_events / dt_s
+
+            # 2. Reconcile approved proposals and apply them
+            self.governance.reconcile_and_apply_approved(sim_minute=sim_min, sim_ts=sim_ts)
+
+            # 3. Anomaly detection & Incident Response
+            for wid, spec in self.workflow_specs.items():
+                cur_cfg = self.api.get_config(wid)["config"]
+                detections = self.detector.scan_workflow(
+                    workflow_id=wid,
+                    sim_minute=sim_min,
+                    sim_ts=sim_ts,
+                    sim_day=sim_day,
+                    active_config=cur_cfg,
+                )
+                if detections:
+                    self.incidents.handle_detections(
+                        detections=detections,
+                        workflow_specs=self.workflow_specs,
+                        sim_minute=sim_min,
+                        sim_ts=sim_ts,
+                    )
+
+            # 4. Statistical Experimentation & Learning Loop
+            # Evaluate after initial baseline period (Day 1+)
+            if sim_day >= 1:
+                for wid, spec in self.workflow_specs.items():
+                    # Check for decay and rollback on previously promoted variants
+                    self.experiments.check_decay_and_rollback(spec, sim_min, sim_ts)
+
+                    active_exp = self.experiments.get_active_experiment(wid)
+                    if active_exp:
+                        # Evaluate active experiment
+                        self.experiments.evaluate_and_promote(
+                            workflow_spec=spec,
+                            sim_minute=sim_min,
+                            sim_ts=sim_ts,
+                        )
+                    else:
+                        # Launch new experiment (test voice first, then welcome message)
+                        # Only propose between 11:00 and 17:00 IST, respecting supervisor edits
+                        if 11 <= current_hour < 17:
+                            sup_dims = self.supervisor_edited_dims.get(wid, set())
+                            first_dim = "welcome_message" if "voice" in sup_dims else "voice"
+                            second_dim = "voice" if first_dim == "welcome_message" else "welcome_message"
+
+                            launched = False
+                            if first_dim not in sup_dims:
+                                launched = self.experiments.design_and_launch(
+                                    workflow_spec=spec,
+                                    dim=first_dim,
+                                    sim_minute=sim_min,
+                                    sim_ts=sim_ts,
+                                )
+                            if not launched and second_dim not in sup_dims:
+                                self.experiments.design_and_launch(
+                                    workflow_spec=spec,
+                                    dim=second_dim,
+                                    sim_minute=sim_min,
+                                    sim_ts=sim_ts,
+                                )
+
+            # Open proposals count
+            approvals = self.api.list_approvals(status="pending")
+            open_props = len(approvals)
 
             state = self.api.get_state()
             credits_rem = state.get("credits_remaining", 0.0)
@@ -200,7 +276,7 @@ class Controller:
             print(
                 f"[TICK] ts={sim_ts} min={sim_min:5d} lag_min=0 "
                 f"events_total={self.total_events:7d} events_sec={events_per_sec:7.1f} "
-                f"open_props={self.open_proposals_count} credits_rem={credits_rem:6.1f} rss_mb={rss_mb:5.1f}",
+                f"open_props={open_props} credits_rem={credits_rem:6.1f} rss_mb={rss_mb:5.1f}",
                 flush=True,
             )
 
