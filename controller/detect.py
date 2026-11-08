@@ -7,10 +7,10 @@ confounds, and logs an auditable Detection record BEFORE any action is proposed.
 from __future__ import annotations
 
 import math
-import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .governance import make_deterministic_key
 from .stats import two_proportion_z_test, wilson_score_interval
 from .store import Store
 
@@ -195,7 +195,7 @@ class AnomalyDetector:
             # Persistence discipline: must trigger across 2 consecutive evaluations
             if self._consecutive_flags[key] >= 2:
                 det = Detection(
-                    detection_id=f"det_did_{uuid.uuid4().hex[:8]}",
+                    detection_id=make_deterministic_key(workflow_id, "det_did", {"did": target_did}, sim_minute),
                     sim_minute=sim_minute,
                     ts=sim_ts,
                     workflow_id=workflow_id,
@@ -259,20 +259,48 @@ class AnomalyDetector:
             return []
 
         rate = halluc / conn
-        baseline_acceptable = 0.010  # 1% acceptable upper threshold for BFSI
 
-        # Test whether hallucination rate is significantly above acceptable threshold (1.5%)
-        # Acute incident threshold: rate > 0.035 (3.5%) with strong significance (p < 0.001)
+        # Derive baseline from observed historical data (prior days or other prompt versions)
+        cur = self.store._conn.cursor()
+        cur.execute(
+            """
+            SELECT SUM(connected) AS base_conn, SUM(halluc_flags) AS base_halluc
+            FROM events_agg
+            WHERE workflow_id = ? AND (sim_day < ? OR prompt_version != ?);
+            """,
+            (workflow_id, sim_day, prompt_ver),
+        )
+        base_row = cur.fetchone()
+        cur.close()
+
+        base_conn = int((base_row and base_row["base_conn"]) or 0)
+        base_halluc = int((base_row and base_row["base_halluc"]) or 0)
+
+        # Baseline rate p_base directly observed from data (or conservative fallback if cold-starting)
+        if base_conn >= 50:
+            p_base = max(0.001, base_halluc / base_conn)
+            k1_pool = base_halluc
+            n1_pool = base_conn
+        else:
+            p_base = 0.005
+            k1_pool = int(conn * p_base)
+            n1_pool = conn
+
+        # Two-proportion z-test comparing recent window vs empirical baseline pool
         z, p_val, diff, _ = two_proportion_z_test(
-            k1=int(conn * 0.015),
-            n1=conn,
+            k1=k1_pool,
+            n1=n1_pool,
             k2=halluc,
             n2=conn,
             alternative="greater",
         )
 
+        # Statistical threshold: rate exceeds baseline + 3 standard errors
+        se = math.sqrt(p_base * (1.0 - p_base) / max(conn, 1))
+        dynamic_threshold = p_base + 3.0 * se
+
         key = f"halluc:{workflow_id}:{prompt_ver}"
-        if rate > 0.035 and p_val < 0.001:
+        if rate > dynamic_threshold and p_val < 0.001:
             self._consecutive_flags[key] = self._consecutive_flags.get(key, 0) + 1
         else:
             self._consecutive_flags[key] = 0
@@ -280,7 +308,7 @@ class AnomalyDetector:
         detections: list[Detection] = []
         if self._consecutive_flags[key] >= 2:
             det = Detection(
-                detection_id=f"det_hal_{uuid.uuid4().hex[:8]}",
+                detection_id=make_deterministic_key(workflow_id, "det_hal", {"prompt": prompt_ver}, sim_minute),
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=workflow_id,
@@ -288,13 +316,18 @@ class AnomalyDetector:
                 target_dim="prompt_version",
                 target_value=prompt_ver,
                 metric_name="hallucination_rate",
-                baseline_val=baseline_acceptable,
+                baseline_val=round(p_base, 4),
                 current_val=round(rate, 4),
                 p_value=round(p_val, 6),
                 evidence={
                     "connected_calls": conn,
                     "hallucinated_calls": halluc,
                     "hallucination_rate": round(rate, 4),
+                    "baseline_connected": base_conn,
+                    "baseline_hallucinated": base_halluc,
+                    "baseline_rate": round(p_base, 4),
+                    "dynamic_threshold": round(dynamic_threshold, 4),
+                    "standard_error": round(se, 5),
                     "consecutive_windows": self._consecutive_flags[key],
                 },
             )
@@ -367,7 +400,7 @@ class AnomalyDetector:
         detections: list[Detection] = []
         if self._consecutive_flags[key] >= 2:
             det = Detection(
-                detection_id=f"det_drf_{uuid.uuid4().hex[:8]}",
+                detection_id=make_deterministic_key(workflow_id, "det_drf", {"kpi": "engagement"}, sim_minute),
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=workflow_id,

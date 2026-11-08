@@ -13,13 +13,38 @@ Enforces:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .api import AutoApplyNotPermittedError, SimApiError, SimClient, StaleBaseVersionError
+from .api import (
+    AutoApplyNotPermittedError,
+    DuplicateProposalIdError,
+    SimApiError,
+    SimClient,
+    StaleBaseVersionError,
+)
 from .store import Store
+
+
+def make_deterministic_key(
+    workflow_id: str,
+    change_class: str,
+    target_config: dict[str, Any],
+    base_version: int,
+) -> str:
+    """Generates a deterministic idempotency key.
+
+    Formula: hash(workflow_id, change_class, target_config_canonical, base_version)
+    Ensures identical crash retries reuse the same key, while:
+      - STALE base version bumps base_version -> new key
+      - Rollback produces a distinct target_config -> new key
+    """
+    canonical_json = json.dumps(target_config, sort_keys=True, separators=(",", ":"))
+    raw = f"{workflow_id}:{change_class}:{canonical_json}:{base_version}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    return f"{change_class}_{workflow_id}_v{base_version}_{digest}"
 
 
 def total_variation_shift(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> float:
@@ -202,7 +227,7 @@ class GovernanceEngine:
         can_auto, auto_reason = self.can_auto_apply(workflow_spec, old_cfg, proposed_config)
 
         if can_auto:
-            auto_prop_id = f"auto_{uuid.uuid4().hex[:12]}"
+            auto_prop_id = make_deterministic_key(wid, "auto", proposed_config, base_version)
             # Auto-apply path
             body = {
                 "proposal_id": auto_prop_id,
@@ -232,7 +257,7 @@ class GovernanceEngine:
                 with self.store.transaction() as cur:
                     cur.execute(
                         """
-                        INSERT INTO proposals (
+                        INSERT OR REPLACE INTO proposals (
                             proposal_id, approval_id, workflow_id, base_version,
                             status, change_summary, diff_json, affected_leads,
                             dry_run_json, impact_score, rationale, evidence_json,
@@ -249,7 +274,7 @@ class GovernanceEngine:
                     )
 
                 self.store.record_decision(
-                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    decision_id=make_deterministic_key(wid, "dec_auto", proposed_config, base_version),
                     sim_minute=sim_minute,
                     ts=sim_ts,
                     workflow_id=wid,
@@ -267,6 +292,11 @@ class GovernanceEngine:
             except AutoApplyNotPermittedError as e:
                 self.store.mark_intent_failed(auto_prop_id, sim_ts, f"auto_apply_forbidden: {e.detail}")
                 # Fall through to approval path below with fresh proposal id
+            except DuplicateProposalIdError:
+                cfg = self.api.get_config(wid)
+                new_ver = cfg.get("version", base_version + 1)
+                self.store.mark_intent_executed(auto_prop_id, sim_ts, cfg)
+                return auto_prop_id
 
         # 2. Human Approval Path
         current_hour = (sim_minute % 1440) // 60
@@ -280,7 +310,7 @@ class GovernanceEngine:
             return None
 
         ttl_hours = min(float(gov.get("proposal_ttl_hours", 24)), 24.0)
-        appr_proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
+        appr_proposal_id = make_deterministic_key(wid, "prop", proposed_config, base_version)
 
         body = {
             "proposal_id": appr_proposal_id,
@@ -316,7 +346,7 @@ class GovernanceEngine:
             with self.store.transaction() as cur:
                 cur.execute(
                     """
-                    INSERT INTO proposals (
+                    INSERT OR REPLACE INTO proposals (
                         proposal_id, approval_id, workflow_id, base_version,
                         status, change_summary, diff_json, affected_leads,
                         dry_run_json, impact_score, rationale, evidence_json,
@@ -332,7 +362,7 @@ class GovernanceEngine:
                 )
 
             self.store.record_decision(
-                decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                decision_id=make_deterministic_key(wid, "dec_submit", proposed_config, base_version),
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=wid,
@@ -343,6 +373,33 @@ class GovernanceEngine:
                 outcome=f"submitted_approval_{aid}",
             )
             return appr_proposal_id
+
+        except DuplicateProposalIdError:
+            # Simulator already accepted this proposal during a pre-crash dispatch
+            approvals = self.api.list_approvals(workflow_id=wid)
+            match = next((a for a in approvals if a.get("proposal_id") == appr_proposal_id), None)
+            if match:
+                aid = match.get("approval_id")
+                self.store.mark_intent_executed(appr_proposal_id, sim_ts, match)
+                with self.store.transaction() as cur:
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO proposals (
+                            proposal_id, approval_id, workflow_id, base_version,
+                            status, change_summary, diff_json, affected_leads,
+                            dry_run_json, impact_score, rationale, evidence_json,
+                            is_auto_apply, created_minute, decided_minute, expires_minute
+                        ) VALUES (?, ?, ?, ?, 'SUBMITTED', ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?);
+                        """,
+                        (
+                            appr_proposal_id, aid, wid, base_version, change_summary,
+                            json.dumps(diff), affected_leads, json.dumps(dry_run),
+                            impact_score, rationale, json.dumps(evidence) if evidence else None,
+                            sim_minute, sim_minute + int(ttl_hours * 60),
+                        ),
+                    )
+                return appr_proposal_id
+            return None
 
         except StaleBaseVersionError:
             self.store.mark_intent_failed(appr_proposal_id, sim_ts, "stale_base_version")
@@ -381,7 +438,7 @@ class GovernanceEngine:
                 with self.store.transaction() as cur:
                     cur.execute("UPDATE proposals SET status = 'STALE' WHERE approval_id = ?;", (aid,))
                 self.store.record_decision(
-                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    decision_id=make_deterministic_key(wid, "dec_stale", {"approval_id": aid}, base_ver),
                     sim_minute=sim_minute,
                     ts=sim_ts,
                     workflow_id=wid,
@@ -394,7 +451,7 @@ class GovernanceEngine:
                 continue
 
             # Apply approval
-            intent_key = f"apply_{aid}_{uuid.uuid4().hex[:6]}"
+            intent_key = make_deterministic_key(wid, "apply", {"approval_id": aid}, base_ver)
             self.store.record_intent(
                 intent_id=f"int_{intent_key}",
                 idempotency_key=intent_key,
@@ -420,7 +477,7 @@ class GovernanceEngine:
                     )
 
                 self.store.record_decision(
-                    decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                    decision_id=make_deterministic_key(wid, "dec_apply", {"approval_id": aid}, base_ver),
                     sim_minute=sim_minute,
                     ts=sim_ts,
                     workflow_id=wid,

@@ -208,7 +208,10 @@ class Controller:
                             (state["sim_minute"], new_ver, aid),
                         )
 
-        # 3. Ingest prior event chunks
+        # 3. Restore active running experiments from store
+        self.experiments.restore_active_experiments()
+
+        # 4. Ingest prior event chunks
         ingest_stats = self.ingest.ingest_available_chunks(kind="events", sim_ts=state["ts"])
         self.total_events += ingest_stats["events"]
         print(

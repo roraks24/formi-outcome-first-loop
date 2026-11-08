@@ -17,7 +17,7 @@ KILL POINT 1: Abrupt kill mid-ingest after committing first chunk
 KILL POINT 2: Abrupt kill between HTTP POST /approvals and local recording
 --------------------------------------------------------------------------------
 [CRASH 2] Controller exited with code 42 (expected 42 from post-submit exit).
-[INSPECTION 2] Local Write-Ahead Intents: [('int_prop_346e824d83b4', 'prop_346e824d83b4', 'request_approval', 'PENDING')]
+[INSPECTION 2] Local Write-Ahead Intents: [('int_prop_nw_renewal_v1_17330392ecb41a10', 'prop_nw_renewal_v1_17330392ecb41a10', 'request_approval', 'PENDING')]
 [INSPECTION 2] Local Proposals Recorded: 0
 [INSPECTION 2] Live Simulator Approvals: 1 approval(s) registered on simulator
 [INSPECTION 2] Intent is PENDING locally but already exists on simulator.
@@ -26,22 +26,42 @@ KILL POINT 2: Abrupt kill between HTTP POST /approvals and local recording
 KILL POINT 3: Abrupt kill between HTTP POST /apply and local recording
 --------------------------------------------------------------------------------
 [CRASH 3] Controller exited with code 43 (expected 43 from post-apply exit).
-[INSPECTION 3] Apply Intents: [('int_apply_apr_00002_ed5c47', 'apply_apr_00002_ed5c47', 'apply_approval', 'PENDING')]
+[INSPECTION 3] Apply Intents: [('int_apply_nw_renewal_v1_2156206474528b88', 'apply_nw_renewal_v1_2156206474528b88', 'apply_approval', 'PENDING')]
 [INSPECTION 3] Approval was applied on simulator, but controller killed before DB update.
+
+--------------------------------------------------------------------------------
+KILL POINT 4: Real unhandled SIGKILL mid-execution
+--------------------------------------------------------------------------------
+[CRASH 4] Sending SIGKILL / TerminateProcess to PID 9812 while actively executing...
+[CRASH 4] Process terminated with returncode 1 (unhandled SIGKILL).
 
 --------------------------------------------------------------------------------
 FINAL RECOVERY: Restarting controller to complete the remaining scenario
 --------------------------------------------------------------------------------
-[FINAL] Controller completed with exit code 0 in 17.66s.
+[FINAL] Controller completed with exit code 0 in 17.80s.
 
 ================================================================================
 CRASH-RECOVERY VERIFICATION SUMMARY
 ================================================================================
 1. Ingestion Continuity: Final cursor (392, 297013, '2027-01-11T21:00:00+05:30'), 109,634 events processed.
 2. Write-Ahead Intent Lifecycle: {'EXECUTED': 10} (all reconciled to EXECUTED/FAILED).
-3. Applied Changes Comparison: Crash run applied = 4, Reference run applied = 3.
-4. Duplicate Applies Count: 0 (Zero duplicate version bumps).
-5. Pending Approvals Preserved: 100% preserved and reconciled across crashes.
-6. State Invariance: All applied changes equal the uninterrupted run.
+3. Applied Changes Sequence Comparison:
+   Reference applied count: 6
+     [REF]   ks_cancel v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [REF]   nw_kyc v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [REF]   nw_renewal v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [REF]   ks_cancel v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+     [REF]   nw_kyc v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+     [REF]   nw_renewal v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+   Crash run applied count: 6
+     [CRASH] ks_cancel v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [CRASH] nw_kyc v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [CRASH] nw_renewal v2: {'allocations.default.voice': {'old': {'V1': 1.0}, 'new': {'V1': 0.8, 'V2': 0.2}}}
+     [CRASH] ks_cancel v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+     [CRASH] nw_kyc v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+     [CRASH] nw_renewal v3: {'allocations.default.welcome_message': {'old': {'W1': 1.0}, 'new': {'W1': 0.8, 'W2': 0.2}}}
+4. Sequence Invariance: 100% IDENTICAL (workflow, version, diff match exactly).
+5. Duplicate Applies Count: 0 (Zero duplicate version bumps).
+6. Pending Approvals Preserved: 100% preserved and reconciled across crashes.
 ================================================================================
-[RESULT] ALL THREE KILL POINTS TESTED AND VERIFIED SUCCESSFULLY.
+[RESULT] ALL FOUR KILL POINTS (INGEST, SUBMIT, APPLY, REAL SIGKILL) TESTED AND PASSED.

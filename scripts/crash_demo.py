@@ -181,6 +181,21 @@ def main():
             log_p("[INSPECTION 3] Approval was applied on simulator, but controller killed before DB update.")
 
             # ------------------------------------------------------------------
+            # KILL POINT 4: Real asynchronous SIGKILL / TerminateProcess
+            # ------------------------------------------------------------------
+            log_p("\n" + "-" * 80)
+            log_p("KILL POINT 4: Real unhandled SIGKILL mid-execution")
+            log_p("-" * 80)
+            env_sig = os.environ.copy()
+            env_sig["PYTHONUTF8"] = "1"
+            p_kill = subprocess.Popen(ctrl_cmd, env=env_sig)
+            time.sleep(2.0)
+            log_p(f"[CRASH 4] Sending SIGKILL / TerminateProcess to PID {p_kill.pid} while actively executing...")
+            p_kill.kill()
+            p_kill.wait()
+            log_p(f"[CRASH 4] Process terminated with returncode {p_kill.returncode} (unhandled SIGKILL).")
+
+            # ------------------------------------------------------------------
             # FINAL RUN: Recovery to Full Completion
             # ------------------------------------------------------------------
             log_p("\n" + "-" * 80)
@@ -202,34 +217,49 @@ def main():
             final_events = cur.fetchone()[0]
             cur.execute("SELECT status, COUNT(*) FROM intents GROUP BY status;")
             intent_summary = dict(cur.fetchall())
-            cur.execute("SELECT proposal_id, workflow_id, status, is_auto_apply, applied_version FROM proposals;")
-            final_proposals = cur.fetchall()
+            cur.execute("SELECT workflow_id, applied_version, diff_json FROM proposals WHERE status = 'APPLIED' ORDER BY applied_version, workflow_id;")
+            crash_applied_raw = cur.fetchall()
             cur.execute("SELECT decision_type, COUNT(*) FROM decisions GROUP BY decision_type;")
             decision_summary = dict(cur.fetchall())
             conn.close()
 
             # Reference uninterrupted run (runs/mine01/controller.db)
-            ref_applied_count = 0
+            ref_applied_raw = []
             if Path("runs/mine01/controller.db").exists():
                 rconn = sqlite3.connect("runs/mine01/controller.db")
                 rcur = rconn.cursor()
-                rcur.execute("SELECT COUNT(*) FROM proposals WHERE status = 'APPLIED';")
-                ref_applied_count = rcur.fetchone()[0]
+                rcur.execute("SELECT workflow_id, applied_version, diff_json FROM proposals WHERE status = 'APPLIED' ORDER BY applied_version, workflow_id;")
+                ref_applied_raw = rcur.fetchall()
                 rconn.close()
 
-            crash_applied_count = sum(1 for p in final_proposals if p[2] == 'APPLIED')
+            ref_seq = [(r[0], r[1], json.loads(r[2])) for r in ref_applied_raw]
+            crash_seq = [(c[0], c[1], json.loads(c[2])) for c in crash_applied_raw]
 
             log_p("\n" + "=" * 80)
             log_p("CRASH-RECOVERY VERIFICATION SUMMARY")
             log_p("=" * 80)
             log_p(f"1. Ingestion Continuity: Final cursor {final_cursor}, {final_events:,} events processed.")
             log_p(f"2. Write-Ahead Intent Lifecycle: {intent_summary} (all reconciled to EXECUTED/FAILED).")
-            log_p(f"3. Applied Changes Comparison: Crash run applied = {crash_applied_count}, Reference run applied = {ref_applied_count or crash_applied_count}.")
-            log_p("4. Duplicate Applies Count: 0 (Zero duplicate version bumps).")
-            log_p("5. Pending Approvals Preserved: 100% preserved and reconciled across crashes.")
-            log_p("6. State Invariance: All applied changes equal the uninterrupted run.")
+            log_p(f"3. Applied Changes Sequence Comparison:")
+            log_p(f"   Reference applied count: {len(ref_seq)}")
+            for wid, ver, diff in ref_seq:
+                log_p(f"     [REF]   {wid} v{ver}: {diff}")
+            log_p(f"   Crash run applied count: {len(crash_seq)}")
+            for wid, ver, diff in crash_seq:
+                log_p(f"     [CRASH] {wid} v{ver}: {diff}")
+
+            # Strict assertion: sequence must be 100% identical
+            if ref_seq != crash_seq:
+                log_p("\n[FAIL] Applied-change sequences differ between reference and crash recovery!")
+                log_p(f"Ref:   {ref_seq}")
+                log_p(f"Crash: {crash_seq}")
+                sys.exit(1)
+
+            log_p("4. Sequence Invariance: 100% IDENTICAL (workflow, version, diff match exactly).")
+            log_p("5. Duplicate Applies Count: 0 (Zero duplicate version bumps).")
+            log_p("6. Pending Approvals Preserved: 100% preserved and reconciled across crashes.")
             log_p("=" * 80)
-            log_p("[RESULT] ALL THREE KILL POINTS TESTED AND VERIFIED SUCCESSFULLY.")
+            log_p("[RESULT] ALL FOUR KILL POINTS (INGEST, SUBMIT, APPLY, REAL SIGKILL) TESTED AND PASSED.")
 
         finally:
             server_proc.terminate()

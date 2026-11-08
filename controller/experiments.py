@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import copy
 import json
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .governance import GovernanceEngine
+from .governance import GovernanceEngine, make_deterministic_key
 from .stats import (
     check_sample_ratio_mismatch,
     compute_mde,
@@ -57,6 +56,10 @@ class ExperimentManager:
 
     def _load_active_experiments(self) -> None:
         """Restores active experiments from SQLite on startup."""
+        self.restore_active_experiments()
+
+    def restore_active_experiments(self) -> None:
+        """Restores active experiments from SQLite on startup or post-crash."""
         cur = self.store._conn.cursor()
         cur.execute("SELECT * FROM experiments WHERE status = 'RUNNING';")
         rows = cur.fetchall()
@@ -98,6 +101,16 @@ class ExperimentManager:
         if wid in self._active_experiments:
             return False
 
+        # SQLite check for existing running experiment or pending proposal
+        cur = self.store._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM proposals WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');", (wid,))
+        pending_props = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM experiments WHERE workflow_id = ? AND status = 'RUNNING';", (wid,))
+        running_exps = cur.fetchone()[0]
+        cur.close()
+        if pending_props > 0 or running_exps > 0:
+            return False
+
         opts = workflow_spec["options"].get(dim, [])
         if len(opts) < 2:
             return False
@@ -110,8 +123,8 @@ class ExperimentManager:
         current_alloc = (cur_cfg.get("allocations", {}).get(cohort_id) or {}).get(dim) or cur_cfg.get("allocations", {}).get("default", {}).get(dim, {})
         control_arm = max(current_alloc.items(), key=lambda x: x[1])[0] if current_alloc else opts[0]
 
-        # Select candidate treatment arms (up to 2 new options to bound multiple testing)
-        candidate_treatments = [o for o in opts if o != control_arm][:2]
+        # Select 1 candidate treatment arm at a time to eliminate multiple negative variant drag
+        candidate_treatments = [o for o in opts if o != control_arm][:1]
         if not candidate_treatments:
             return False
 
@@ -150,7 +163,9 @@ class ExperimentManager:
             window = workflow_spec.get("dialling_window", [9, 21])
             daily_size = dph * (window[1] - window[0])
 
-        treat_share = 0.40 / len(candidate_treatments)
+        # High volume: 10% treatment share (bounds worst-case -10% variant drop to -1.0%)
+        # Lower volume: 20% treatment share
+        treat_share = 0.10 if daily_size >= 2000 else 0.20
         if primary_kpi == "engagement_rate":
             pickup_est = (conn / dials) if dials > 0 else 0.30
             daily_eval_units = daily_size * pickup_est
@@ -158,26 +173,48 @@ class ExperimentManager:
             daily_eval_units = daily_size
 
         max_duration_days = 3.0
-        expected_n_per_arm = max(100, int(daily_eval_units * treat_share * max_duration_days))
+        max_achievable_n = max(50, int(daily_eval_units * treat_share * max_duration_days))
 
         # Dynamic MDE derived per experiment from available volume, baseline rate, and power
-        mde = compute_mde(baseline_rate=baseline_p, sample_size_per_arm=expected_n_per_arm, alpha=0.05, power=0.80)
+        mde = compute_mde(baseline_rate=baseline_p, sample_size_per_arm=max_achievable_n, alpha=0.05, power=0.80)
         required_n = required_sample_size(baseline_rate=baseline_p, mde=mde, alpha=0.05, power=0.80)
 
-        # Allocate 60% to control, divide 40% among treatment arms
-        treat_weight = round(0.40 / len(candidate_treatments), 4)
-        ctrl_weight = round(1.0 - (treat_weight * len(candidate_treatments)), 4)
-        alloc_weights = {control_arm: ctrl_weight}
-        for t in candidate_treatments:
-            alloc_weights[t] = treat_weight
+        # Sizing feasibility check: if required n cannot be reached within max horizon
+        # or if volume is so small that MDE exceeds 35% (statistically infeasible)
+        if max_achievable_n < 100 or mde > 0.35:
+            self.store.record_decision(
+                decision_id=make_deterministic_key(wid, f"dec_infeasible_{dim}", {"mde": round(mde, 3)}, base_version),
+                sim_minute=sim_minute,
+                ts=sim_ts,
+                workflow_id=wid,
+                decision_type="EXPERIMENT_SKIPPED",
+                inputs_ref={"dimension": dim, "candidate": candidate_treatments[0]},
+                numbers={
+                    "baseline_rate": round(baseline_p, 4),
+                    "daily_eval_units": round(daily_eval_units, 1),
+                    "treat_share": treat_share,
+                    "max_achievable_n": max_achievable_n,
+                    "required_n": required_n,
+                    "dynamic_mde": round(mde, 4),
+                    "max_duration_days": max_duration_days,
+                },
+                policy_clause="statistical_integrity.mde_feasibility",
+                outcome=f"infeasible, skipped: required_n={required_n} > achievable={max_achievable_n} at MDE={mde:.3f}",
+            )
+            return False
+
+        # Allocate control and treatment arms
+        treat_weight = round(treat_share, 4)
+        ctrl_weight = round(1.0 - treat_weight, 4)
+        alloc_weights = {control_arm: ctrl_weight, candidate_treatments[0]: treat_weight}
 
         proposed_cfg = copy.deepcopy(cur_cfg)
         proposed_cfg.setdefault("allocations", {}).setdefault(cohort_id, {})[dim] = alloc_weights
 
-        exp_id = f"exp_{wid}_{dim}_{uuid.uuid4().hex[:6]}"
-        change_summary = f"A/B test on {wid} ({dim}): {control_arm} vs {', '.join(candidate_treatments)}"
+        exp_id = make_deterministic_key(wid, f"exp_{dim}", proposed_cfg, base_version)
+        change_summary = f"A/B test on {wid} ({dim}): {control_arm} vs {candidate_treatments[0]}"
         rationale = (
-            f"Testing {len(candidate_treatments)} candidate variants against control {control_arm}. "
+            f"Testing candidate variant {candidate_treatments[0]} against control {control_arm}. "
             f"Target sample size: n={required_n} per arm based on baseline {baseline_p:.3f} and dynamic MDE {mde:.3f}."
         )
 
@@ -303,7 +340,7 @@ class ExperimentManager:
             # Abort experiment due to allocation imbalance
             self._close_experiment(exp, "INVALIDATED", None, sim_minute)
             self.store.record_decision(
-                decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                decision_id=make_deterministic_key(wid, "dec_srm", {"exp_id": exp.experiment_id}, sim_minute),
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=wid,
@@ -331,6 +368,10 @@ class ExperimentManager:
             k_ctrl_g = ctrl["engaged"]
             n_ctrl_g = ctrl["connected"]
 
+        obj = workflow_spec.get("objective", {})
+        guardrail_spec = obj.get("guardrail", {})
+        max_drop = float(guardrail_spec.get(f"{exp.guardrail_kpi}_max_drop", 0.02))
+
         for t in treatment_arms:
             t_stats = arm_stats[t]
             if exp.primary_kpi == "engagement_rate":
@@ -348,8 +389,8 @@ class ExperimentManager:
             z, p_val, diff, ci = two_proportion_z_test(k_ctrl, n_ctrl, k_t, n_t, alternative="greater")
             primary_p_values.append(p_val)
 
-            # Test guardrail KPI
-            is_vetoed, g_delta, g_ci = guardrail_veto_check(k_ctrl_g, n_ctrl_g, k_t_g, n_t_g, max_drop=0.02)
+            # Test guardrail KPI with policy-derived max_drop
+            is_vetoed, g_delta, g_ci = guardrail_veto_check(k_ctrl_g, n_ctrl_g, k_t_g, n_t_g, max_drop=max_drop)
 
             treatment_results.append({
                 "arm": t,
@@ -381,7 +422,7 @@ class ExperimentManager:
             decision_str = "WINNER" if (is_sig and not is_vetoed and diff > 0.01) else "GUARDRAIL_VETO" if is_vetoed else "INFERIOR"
 
             # Record analysis row in SQLite
-            analysis_id = f"ana_{uuid.uuid4().hex[:8]}"
+            analysis_id = make_deterministic_key(exp.experiment_id, "ana", {"arm": arm}, sim_minute)
             with self.store.transaction() as cur:
                 cur.execute(
                     """
@@ -464,6 +505,17 @@ class ExperimentManager:
                 holdout_arm=exp.control_arm,
                 promoted_minute=sim_minute,
                 promoted_rate=lift,
+            )
+            self.store.record_decision(
+                decision_id=make_deterministic_key(wid, "dec_promote", {"winner": winner}, base_version),
+                sim_minute=sim_minute,
+                ts=sim_ts,
+                workflow_id=wid,
+                decision_type="WINNER_PROMOTED",
+                inputs_ref={"experiment_id": exp.experiment_id, "proposal_id": prop_id, "winner_arm": winner},
+                numbers={"measured_lift": lift, "base_version": base_version},
+                policy_clause="experiments.promotion",
+                outcome=f"promoted_{winner}_with_holdout",
             )
 
     def check_decay_and_rollback(
@@ -568,7 +620,7 @@ class ExperimentManager:
                 if prop_id:
                     self.store.mark_promoted_variant_rolled_back(wid, cohort_id, dim)
                     self.store.record_decision(
-                        decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+                        decision_id=make_deterministic_key(wid, "dec_rollback", {"variant": winner}, base_version),
                         sim_minute=sim_minute,
                         ts=sim_ts,
                         workflow_id=wid,

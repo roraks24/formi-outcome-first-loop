@@ -98,5 +98,33 @@ def test_stale_base_diff_detection():
 
     # TV distance calculation
     tv = total_variation_shift(old_cfg, new_cfg)
-    # 0.5 * (|1.0 - 0.6| + |0.0 - 0.4|) = 0.5 * (0.4 + 0.4) = 0.4
-    assert pytest.approx(tv, 1e-4) == 0.4
+    assert tv == 0.4
+
+
+def test_deterministic_idempotency_keys():
+    from controller.governance import make_deterministic_key
+
+    wid = "ks_cancel"
+    change_class = "caller_id"
+    cfg1 = {"allocations": {"default": {"caller_id": {"D1": 0.5, "D2": 0.5}}}}
+    # Same config with different key insertion order
+    cfg1_permuted = {"allocations": {"default": {"caller_id": {"D2": 0.5, "D1": 0.5}}}}
+    base_ver = 2
+
+    key1 = make_deterministic_key(wid, change_class, cfg1, base_ver)
+    key1_perm = make_deterministic_key(wid, change_class, cfg1_permuted, base_ver)
+
+    # 1. Exact identity and permutation invariance
+    assert key1 == key1_perm
+    assert key1.startswith("caller_id_ks_cancel_v2_")
+
+    # 2. STALE base version bump produces distinct key for legitimate re-proposal
+    key_v3 = make_deterministic_key(wid, change_class, cfg1, base_version=3)
+    assert key_v3 != key1
+    assert key_v3.startswith("caller_id_ks_cancel_v3_")
+
+    # 3. Rollback target produces distinct key
+    cfg_rollback = {"allocations": {"default": {"caller_id": {"D1": 1.0}}}}
+    key_rollback = make_deterministic_key(wid, change_class, cfg_rollback, base_ver)
+    assert key_rollback != key1
+
