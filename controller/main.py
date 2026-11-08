@@ -286,8 +286,8 @@ class Controller:
                         )
                     else:
                         # Launch new experiment (test voice first, then welcome message)
-                        # Only propose between 11:00 and 17:00 IST, respecting supervisor edits
-                        if 11 <= current_hour < 17:
+                        # Propose within approver working hours, respecting supervisor edits
+                        if self.governance.is_within_approver_hours(spec, current_hour):
                             sup_dims = self.supervisor_edited_dims.get(wid, set())
                             first_dim = "welcome_message" if "voice" in sup_dims else "voice"
                             second_dim = "voice" if first_dim == "welcome_message" else "welcome_message"

@@ -261,7 +261,8 @@ def guardrail_veto_check(
     ci_upper = delta + 1.95996 * se
 
     z, p_val_less, _, _ = two_proportion_z_test(k_ctrl, n_ctrl, k_treat, n_treat, alternative="less")
-    is_vetoed = delta < -max_drop or (delta < -0.015 and p_val_less < 0.05)
+    confident_threshold = max_drop * 0.75
+    is_vetoed = delta < -max_drop or (delta < -confident_threshold and p_val_less < 0.05)
     return is_vetoed, float(delta), (float(ci_lower), float(ci_upper))
 
 
