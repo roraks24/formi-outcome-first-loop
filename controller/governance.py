@@ -228,6 +228,13 @@ class GovernanceEngine:
 
         if can_auto:
             auto_prop_id = make_deterministic_key(wid, "auto", proposed_config, base_version)
+            cur = self.store._conn.cursor()
+            cur.execute("SELECT status FROM intents WHERE idempotency_key = ?;", (auto_prop_id,))
+            i_row = cur.fetchone()
+            cur.close()
+            if i_row:
+                return auto_prop_id
+
             # Auto-apply path
             body = {
                 "proposal_id": auto_prop_id,
@@ -311,6 +318,17 @@ class GovernanceEngine:
 
         ttl_hours = min(float(gov.get("proposal_ttl_hours", 24)), 24.0)
         appr_proposal_id = make_deterministic_key(wid, "prop", proposed_config, base_version)
+
+        # Idempotency check: if this exact proposal was already recorded locally
+        cur = self.store._conn.cursor()
+        cur.execute("SELECT status FROM proposals WHERE proposal_id = ?;", (appr_proposal_id,))
+        p_row = cur.fetchone()
+        cur.execute("SELECT status FROM intents WHERE idempotency_key = ?;", (appr_proposal_id,))
+        i_row = cur.fetchone()
+        cur.close()
+        if p_row or i_row:
+            # If already pending, return proposal_id; if decided/rejected, suppress duplicate submission
+            return appr_proposal_id if (p_row and p_row["status"] in ("SUBMITTED", "PENDING")) else None
 
         body = {
             "proposal_id": appr_proposal_id,
@@ -452,6 +470,13 @@ class GovernanceEngine:
 
             # Apply approval
             intent_key = make_deterministic_key(wid, "apply", {"approval_id": aid}, base_ver)
+            cur = self.store._conn.cursor()
+            cur.execute("SELECT status FROM intents WHERE idempotency_key = ?;", (intent_key,))
+            i_row = cur.fetchone()
+            cur.close()
+            if i_row and i_row["status"] == "EXECUTED":
+                continue
+
             self.store.record_intent(
                 intent_id=f"int_{intent_key}",
                 idempotency_key=intent_key,
