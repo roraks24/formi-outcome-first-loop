@@ -292,9 +292,9 @@ class Controller:
 
 def main():
     parser = argparse.ArgumentParser(description="Formi Outcome-First Agent Loop Controller")
-    parser.add_argument("--url", default="http://127.0.0.1:8700", help="Simulator server URL")
+    parser.add_argument("--url", "--sim-url", dest="url", default="http://127.0.0.1:8700", help="Simulator server URL")
     parser.add_argument("--db", default="runs/controller.db", help="Path to SQLite WAL database")
-    parser.add_argument("--tick", type=int, default=15, help="Sim minutes to advance per tick")
+    parser.add_argument("--tick", "--ticks", dest="tick", type=int, default=15, help="Sim minutes to advance per tick")
     args = parser.parse_args()
 
     controller = Controller(sim_url=args.url, db_path=args.db, tick_minutes=args.tick)

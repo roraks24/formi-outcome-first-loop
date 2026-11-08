@@ -1,0 +1,34 @@
+===========================================================================
+CRASH-RECOVERY DEMO (C13)
+Scenario: public_01_dev | Database: SQLite WAL with write-ahead intents
+===========================================================================
+[DEMO] Launching simulator: C:\Users\user\AppData\Local\Programs\Python\Python311\python.exe -m sim serve --scenario scenarios/public_01_dev.yaml --run-dir runs\crash_demo --port 8795 --force
+[DEMO] Simulator ready at http://127.0.0.1:8795
+[DEMO] Starting controller (Run 1): C:\Users\user\AppData\Local\Programs\Python\Python311\python.exe -m controller.main --sim-url http://127.0.0.1:8795 --db runs\crash_demo\controller.db --ticks 15
+[DEMO] Allowing controller to run and ingest initial chunks...
+
+[CRASH EVENT] >>> Simulating catastrophic crash: sending KILL to controller! <<<
+[CRASH EVENT] Controller process 15640 killed abruptly (exit code 1).
+
+[DEMO INSPECTION POST-CRASH]
+  - Persisted Cursor: ('events', 35, 198132, '2027-01-04T17:30:00+05:30')
+  - Events Seen (dedup cache): 10753
+  - Write-ahead Intents Recorded: 0
+  - SQLite WAL integrity: clean and uncorrupted
+
+[DEMO] Restarting controller (Run 2 - Recovery)...
+[DEMO] Controller will run recover() and resume seamlessly from persisted cursor.
+
+[DEMO] Controller Run 2 exited cleanly with code 0 in 16.76s.
+
+[FINAL VERIFICATION]
+  - Final Cursor: ('events', 392, 297009, '2027-01-11T21:00:00+05:30')
+  - Total Events Ingested: 109630 (exact dedup match)
+  - Intent Reconciliation: {'EXECUTED': 6}
+  - Total Proposals: 3
+  - Total Audited Decisions: 6
+  - Double Apply Count: 0 (verified by unique idempotency keys)
+  - Lost Learning / Broken State: None
+
+[DEMO RESULT] CRASH RECOVERY DEMONSTRATION SUCCESSFUL.
+===========================================================================
