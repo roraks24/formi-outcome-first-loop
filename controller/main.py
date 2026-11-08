@@ -89,6 +89,7 @@ class Controller:
 
         self.running = True
         self.total_events = 0
+        self.tick_durations: list[float] = []
         self.workflow_specs: dict[str, dict[str, Any]] = {}
         self.supervisor_edited_dims: dict[str, set[str]] = {}
         self._setup_signals()
@@ -319,6 +320,7 @@ class Controller:
                 f"open_props={open_props} credits_rem={credits_rem:6.1f} rss_mb={rss_mb:5.1f}",
                 flush=True,
             )
+            self.tick_durations.append(time.perf_counter() - t0)
 
             if finished:
                 print("\n[LOOP] Reached end of scenario.", file=sys.stderr)
