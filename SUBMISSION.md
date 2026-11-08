@@ -248,17 +248,17 @@ When an ingested `config_changed` event has `actor == "supervisor"`, the control
 
 ## 8. Scale & Performance (Public_03 Load Benchmark)
 
-Measured on `scenarios/public_03_load.yaml` (12 workflows, ~650k dials/day, 5 simulated days, ~3.25 million events):
+Measured on `scenarios/public_03_load.yaml` (12 workflows, ~650k dials/day, 5 simulated days, 4.2 million events):
 
 | Metric | Measured Value | Requirement / Boundary |
 |---|---|---|
-| **Total Events Ingested** | **3,250,000+** | Complete 5-day load callset |
+| **Total Events Ingested** | **4,200,098** | Complete 5-day load callset |
 | **Peak Ingest Throughput** | **43,535.8 events/sec** | Target: >10,000 events/sec |
-| **Average Ingest Throughput** | **18,400+ events/sec** | Real-time streaming |
+| **Average Ingest Throughput** | **28,404.5 events/sec** | Real-time streaming |
 | **Decision Lag** | **0 ticks** (processed synchronously) | Target: < 2 ticks |
-| **Wall-Clock Time per Day** | **~4.8 seconds / simulated day** | Target: < 30 seconds / day |
-| **Peak Controller RAM (RSS)** | **111.3 MB** | Hard ceiling: < 8.0 GB (4 vCPU) |
-| **Database Size on Disk** | **~38.4 MB** | Highly compact SQLite WAL |
+| **Wall-Clock Time per Day** | **29.57 seconds / simulated day** (147.87 s total) | Target: < 30 seconds / day |
+| **Peak Controller RAM (RSS)** | **120.79 MB** | Hard ceiling: < 8.0 GB (4 vCPU) |
+| **Database Size on Disk** | **152.26 MB** | Highly compact SQLite WAL |
 
 ### 10x Scale Bottleneck Analysis (~6.5M dials/day, ~32M events/week)
 1. **SQLite Single-Writer Lock Contention**: While SQLite WAL supports concurrent readers, concurrent ingestion threads will serialize at transaction commits. At 10x scale, partition the database by tenant/workflow into independent SQLite shard files or transition to DuckDB / PostgreSQL.

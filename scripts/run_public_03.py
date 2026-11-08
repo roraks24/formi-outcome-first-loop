@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 from controller.main import Controller, get_process_rss_mb
 
 
-def wait_for_server(url: str, timeout_s: float = 60.0) -> None:
+def wait_for_server(url: str, timeout_s: float = 300.0) -> None:
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         try:
@@ -86,7 +86,7 @@ def main():
     server_proc = subprocess.Popen(server_cmd)
 
     try:
-        wait_for_server(sim_url, timeout_s=60.0)
+        wait_for_server(sim_url, timeout_s=300.0)
         print(f"[LOAD] Simulator server ready at {sim_url}")
 
         # 3. Run controller with profiling
