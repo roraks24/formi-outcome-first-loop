@@ -164,7 +164,7 @@ def main():
     subparsers = parser.add_subparsers(dest="cmd")
 
     why_p = subparsers.add_parser("why", help="Explain why a workflow changed at a specific time")
-    why_p.add_argument("--workflow", required=True, help="Workflow ID (e.g. nw_renewal)")
+    why_p.add_argument("--workflow", required=True, help="Workflow identifier")
     why_p.add_argument("--at", required=False, help="Time specifier (e.g. 'D3 14:00' or ISO string)")
     why_p.add_argument("--db", default=None, help="Path to controller SQLite database")
 

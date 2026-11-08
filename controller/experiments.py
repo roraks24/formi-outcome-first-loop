@@ -19,6 +19,7 @@ from typing import Any
 from .governance import GovernanceEngine
 from .stats import (
     check_sample_ratio_mismatch,
+    compute_mde,
     guardrail_veto_check,
     holm_bonferroni_correction,
     required_sample_size,
@@ -142,8 +143,25 @@ class ExperimentManager:
         else:
             baseline_p = (conn / dials) if dials > 0 else 0.30
 
-        # Statistical power calculation
-        mde = 0.08  # Target 8% relative lift
+        # Dynamically compute MDE and required sample size from baseline rate, power and max duration
+        daily_size = workflow_spec.get("daily_batch", {}).get("size")
+        if not daily_size:
+            dph = workflow_spec.get("dials_per_hour", 200)
+            window = workflow_spec.get("dialling_window", [9, 21])
+            daily_size = dph * (window[1] - window[0])
+
+        treat_share = 0.40 / len(candidate_treatments)
+        if primary_kpi == "engagement_rate":
+            pickup_est = (conn / dials) if dials > 0 else 0.30
+            daily_eval_units = daily_size * pickup_est
+        else:
+            daily_eval_units = daily_size
+
+        max_duration_days = 3.0
+        expected_n_per_arm = max(100, int(daily_eval_units * treat_share * max_duration_days))
+
+        # Dynamic MDE derived per experiment from available volume, baseline rate, and power
+        mde = compute_mde(baseline_rate=baseline_p, sample_size_per_arm=expected_n_per_arm, alpha=0.05, power=0.80)
         required_n = required_sample_size(baseline_rate=baseline_p, mde=mde, alpha=0.05, power=0.80)
 
         # Allocate 60% to control, divide 40% among treatment arms
@@ -160,7 +178,7 @@ class ExperimentManager:
         change_summary = f"A/B test on {wid} ({dim}): {control_arm} vs {', '.join(candidate_treatments)}"
         rationale = (
             f"Testing {len(candidate_treatments)} candidate variants against control {control_arm}. "
-            f"Target sample size: n={required_n} per arm based on baseline {baseline_p:.3f} and MDE {mde:.2f}."
+            f"Target sample size: n={required_n} per arm based on baseline {baseline_p:.3f} and dynamic MDE {mde:.3f}."
         )
 
         dry_run = {
@@ -194,12 +212,12 @@ class ExperimentManager:
                         experiment_id, workflow_id, cohort_id, dim, control_arm,
                         arms_json, status, primary_kpi, guardrail_kpi,
                         required_n_per_arm, alpha, power, mde, created_minute
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, 0.05, 0.80, 0.08, ?);
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, 0.05, 0.80, ?, ?);
                     """,
                     (
                         exp_id, wid, cohort_id, dim, control_arm,
                         json.dumps(all_arms), primary_kpi, guardrail_kpi,
-                        required_n, sim_minute,
+                        required_n, round(mde, 4), sim_minute,
                     ),
                 )
 

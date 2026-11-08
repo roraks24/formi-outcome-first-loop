@@ -48,6 +48,93 @@ def required_sample_size(
     return max(n, min_floor)
 
 
+def compute_mde(
+    baseline_rate: float,
+    sample_size_per_arm: int,
+    alpha: float = 0.05,
+    power: float = 0.80,
+) -> float:
+    """Computes relative Minimum Detectable Effect (MDE) given available sample size per arm.
+
+    Formula:
+      MDE_rel = (z_{alpha/2} + z_{beta}) * sqrt(2 * (1 - p) / (p * N))
+    where:
+      p = baseline_rate
+      N = sample_size_per_arm
+      z_{alpha/2} = standard normal quantile for significance level (1.96 for alpha=0.05)
+      z_{beta} = standard normal quantile for statistical power (0.84 for power=0.80)
+    """
+    if sample_size_per_arm <= 10 or baseline_rate <= 0.01 or baseline_rate >= 0.99:
+        return 0.10
+    z_alpha = st.norm.ppf(1.0 - alpha / 2.0)
+    z_beta = st.norm.ppf(power)
+    factor = z_alpha + z_beta
+    p = baseline_rate
+    rel_mde = factor * math.sqrt(2.0 * (1.0 - p) / (p * sample_size_per_arm))
+    return max(0.01, min(0.35, float(rel_mde)))
+
+
+def cluster_robust_two_proportion_test(
+    arm1_lead_outcomes: Sequence[tuple[int, int]],
+    arm2_lead_outcomes: Sequence[tuple[int, int]],
+) -> tuple[float, float, float, tuple[float, float]]:
+    """Performs cluster-robust two-proportion test accounting for lead-level clustering of dials.
+
+    Formula:
+      Let cluster i in arm k have m_{k,i} total dials and y_{k,i} successes.
+      Total observations: N_k = sum_{i=1}^{M_k} m_{k,i}
+      Total successes:    Y_k = sum_{i=1}^{M_k} y_{k,i}
+      Arm rate:           p_hat_k = Y_k / N_k
+
+      Cluster residual:   e_{k,i} = y_{k,i} - m_{k,i} * p_hat_k
+      Cluster-robust variance (Huber-White / Rao-Scott cluster estimator):
+        Var_cluster(p_hat_k) = [M_k / (M_k - 1)] * [sum_{i=1}^{M_k} e_{k,i}^2] / N_k^2
+
+      Two-sample variance:
+        SE_cluster = sqrt(Var_cluster(p_hat_1) + Var_cluster(p_hat_2))
+        z = (p_hat_2 - p_hat_1) / SE_cluster
+        p_val = 2 * (1 - Phi(|z|))
+
+    Unlike naive binomial z-tests which assume independent Bernoulli trials and severely
+    deflate standard error when intra-cluster correlation (ICC) > 0 (anti-conservative),
+    this estimator accounts for multi-dial correlation within each lead.
+    """
+    m1 = len(arm1_lead_outcomes)
+    m2 = len(arm2_lead_outcomes)
+    if m1 < 2 or m2 < 2:
+        return 0.0, 1.0, 0.0, (0.0, 0.0)
+
+    y1 = sum(lead[0] for lead in arm1_lead_outcomes)
+    n1 = sum(lead[1] for lead in arm1_lead_outcomes)
+    y2 = sum(lead[0] for lead in arm2_lead_outcomes)
+    n2 = sum(lead[1] for lead in arm2_lead_outcomes)
+
+    if n1 <= 0 or n2 <= 0:
+        return 0.0, 1.0, 0.0, (0.0, 0.0)
+
+    p1 = y1 / n1
+    p2 = y2 / n2
+    diff = p2 - p1
+
+    # Cluster residuals & cluster-robust variance
+    ss1 = sum((lead[0] - lead[1] * p1) ** 2 for lead in arm1_lead_outcomes)
+    var1 = (m1 / (m1 - 1)) * (ss1 / (n1 ** 2))
+
+    ss2 = sum((lead[0] - lead[1] * p2) ** 2 for lead in arm2_lead_outcomes)
+    var2 = (m2 / (m2 - 1)) * (ss2 / (n2 ** 2))
+
+    se_diff = math.sqrt(var1 + var2)
+    if se_diff < 1e-12:
+        return 0.0, 1.0, diff, (diff, diff)
+
+    z_stat = diff / se_diff
+    p_val = 2.0 * (1.0 - st.norm.cdf(abs(z_stat)))
+    ci_lower = diff - 1.96 * se_diff
+    ci_upper = diff + 1.96 * se_diff
+
+    return z_stat, p_val, diff, (ci_lower, ci_upper)
+
+
 def two_proportion_z_test(
     k1: int,
     n1: int,

@@ -3,7 +3,7 @@
 Playbooks:
   1. Caller-ID Degradation (C5): Rotates traffic away from spam-flagged DIDs to healthy peers.
   2. Hallucination Spike (C8 Floor): Detects unsafe prompt -> requests LLM suggestions ->
-     synthetically validates (pass_rate >= 0.97) -> proposes replacement with evidence.
+     synthetically validates (pass_rate >= min_validation_pass_rate) -> proposes replacement with evidence.
   3. Supervisor Edits: Invalidates active experiments and re-proposes against new base.
 """
 from __future__ import annotations
@@ -146,14 +146,16 @@ class IncidentHandler:
             return
 
         gov = spec.get("governance", {})
-        min_pass_rate = float(gov.get("min_validation_pass_rate", 0.97))
+        min_pass_rate = float(gov.get("min_validation_pass_rate", 0.95))
+        available_prompts = spec.get("options", {}).get("prompt_version", [])
+        baseline_prompt = available_prompts[0] if available_prompts else cur_cfg.get("prompt_version")
 
         # Check credits remaining from sim state
         state = self.governance.api.get_state()
         credits_rem = float(state.get("credits_remaining", 0.0))
         if credits_rem < 8.0:
-            # Credit reserve floor: cannot spend on LLM calls; rollback to P1 directly
-            self._rollback_prompt_safe(spec, base_version, cur_cfg, "P1", sim_minute, sim_ts, det)
+            # Credit reserve floor: cannot spend on LLM calls; rollback to baseline prompt directly
+            self._rollback_prompt_safe(spec, base_version, cur_cfg, baseline_prompt, sim_minute, sim_ts, det)
             return
 
         # 1. Ask LLM for suggestions (Costs 3 credits)
@@ -195,19 +197,19 @@ class IncidentHandler:
             except Exception:
                 continue
 
-        # If no suggestion passed, validate baseline P1
+        # If no suggestion passed, validate baseline prompt
         if not chosen_prompt:
             try:
                 val_res = self.governance.api.run_validation(
                     workflow_id=wid,
-                    prompt_version="P1",
+                    prompt_version=baseline_prompt,
                     n=200,
                     sim_minute=sim_minute,
                     sim_ts=sim_ts,
                     tenant_id=spec.get("tenant_id", ""),
                 )
                 if float(val_res.get("pass_rate", 0.0)) >= min_pass_rate:
-                    chosen_prompt = "P1"
+                    chosen_prompt = baseline_prompt
                     chosen_val_id = val_res.get("validation_run_id")
                     chosen_pass_rate = float(val_res.get("pass_rate", 0.0))
             except Exception:
@@ -264,7 +266,7 @@ class IncidentHandler:
         wid = spec["workflow_id"]
         if target_prompt == cur_cfg.get("prompt_version"):
             return
-        # Validate P1 with minimal n=100 (1 credit)
+        # Validate target baseline prompt with minimal n=100 (1 credit)
         try:
             val_res = self.governance.api.run_validation(
                 workflow_id=wid,

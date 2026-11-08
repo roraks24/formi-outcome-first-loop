@@ -234,7 +234,9 @@ class AnomalyDetector:
         """Detects if prompt hallucination rate spikes beyond safe baseline (1%)."""
         cur = self.store._conn.cursor()
         # Query hallucination counts for current prompt in trailing 24 hours
-        prompt_ver = active_config.get("prompt_version", "P1")
+        prompt_ver = active_config.get("prompt_version")
+        if not prompt_ver:
+            return []
         cur.execute(
             """
             SELECT SUM(connected) AS total_conn, SUM(halluc_flags) AS total_halluc

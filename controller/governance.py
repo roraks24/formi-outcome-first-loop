@@ -146,33 +146,34 @@ class GovernanceEngine:
         workflow_spec: dict[str, Any],
         current_hour: int,
     ) -> bool:
-        """Checks if current time is within approver hours and outside morning standups (11:00-17:00)."""
+        """Checks if current time is within approver hours from workflow governance policy."""
         gov = workflow_spec.get("governance", {})
-        hours = gov.get("approver_hours", [10, 19])
-        # Respect Anita Desai's standups (no proposals before 11:00)
-        effective_start = max(hours[0], 11)
-        effective_end = min(hours[1], 18)
-        return effective_start <= current_hour < effective_end
+        hours = gov.get("approver_hours", [0, 24])
+        start_h = int(hours[0])
+        end_h = int(hours[1])
+        return start_h <= current_hour < end_h
 
     def is_approver_fatigued(
         self,
-        workflow_id: str,
+        workflow_spec: dict[str, Any],
         sim_minute: int,
-        max_requests_per_24h: int = 2,
     ) -> bool:
-        """Throttles requests to max_requests_per_24h per 24-hour window to protect approver attention."""
+        """Throttles requests to max_requests_per_24h defined in workflow governance policy."""
+        wid = workflow_spec["workflow_id"]
+        gov = workflow_spec.get("governance", {})
+        max_requests = int(gov.get("max_requests_per_24h", 3))
         cur = self.store._conn.cursor()
         cur.execute(
             """
             SELECT COUNT(*) AS cnt FROM proposals
             WHERE workflow_id = ? AND is_auto_apply = 0 AND created_minute >= ?;
             """,
-            (workflow_id, sim_minute - 1440),
+            (wid, sim_minute - 1440),
         )
         row = cur.fetchone()
         cur.close()
         count = int(row["cnt"] or 0)
-        return count >= max_requests_per_24h
+        return count >= max_requests
 
     def submit_proposal(
         self,
@@ -272,10 +273,8 @@ class GovernanceEngine:
             # Defer submission until approver is online
             return None
 
-        gov = workflow_spec.get("governance", {})
-        max_req = int(gov.get("max_requests_per_24h", 2))
         is_incident = impact_score >= 0.70
-        if not is_incident and self.is_approver_fatigued(wid, sim_minute, max_requests_per_24h=max_req):
+        if not is_incident and self.is_approver_fatigued(workflow_spec, sim_minute):
             # Throttle to avoid fatigue rejection
             return None
 

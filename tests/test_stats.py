@@ -6,6 +6,8 @@ import pytest
 
 from controller.stats import (
     check_sample_ratio_mismatch,
+    cluster_robust_two_proportion_test,
+    compute_mde,
     cusum_drift_score,
     guardrail_veto_check,
     holm_bonferroni_correction,
@@ -115,3 +117,61 @@ def test_cusum_drift_false_positive_rate_on_null_data():
 
     fp_rate = false_alarms / n_trials
     assert fp_rate <= 0.05
+
+
+def test_compute_mde_dynamic():
+    """Computes MDE dynamically from baseline rate, sample size, and power."""
+    # Low volume workflow (n=300 per arm): requires large lift to detect
+    mde_low = compute_mde(baseline_rate=0.50, sample_size_per_arm=300, alpha=0.05, power=0.80)
+    # High volume workflow (n=5000 per arm): can detect subtle lifts
+    mde_high = compute_mde(baseline_rate=0.50, sample_size_per_arm=5000, alpha=0.05, power=0.80)
+
+    assert mde_low > 0.15  # ~23% MDE
+    assert mde_high < 0.06  # ~5.6% MDE
+    assert mde_low > mde_high
+
+
+def test_lead_clustered_estimator_anti_conservative_naive():
+    """Proves naive binomial z-test is anti-conservative on clustered multi-dial leads,
+    while cluster_robust_two_proportion_test maintains nominal error control under H0.
+    """
+    rng = np.random.default_rng(42)
+    n_sims = 200
+    leads_per_arm = 120
+    dials_per_lead = 5
+
+    naive_rejections = 0
+    cluster_rejections = 0
+
+    for _ in range(n_sims):
+        # Realistic voice calling mixture: responsive leads (p=0.70) vs unresponsive leads (p=0.05)
+        # creates strong intra-cluster correlation across multi-dial retry cadences.
+        p1 = rng.choice([0.70, 0.05], size=leads_per_arm, p=[0.40, 0.60])
+        p2 = rng.choice([0.70, 0.05], size=leads_per_arm, p=[0.40, 0.60])
+
+        arm1_leads = [(int(rng.binomial(dials_per_lead, p)), dials_per_lead) for p in p1]
+        arm2_leads = [(int(rng.binomial(dials_per_lead, p)), dials_per_lead) for p in p2]
+
+        # Naive two-proportion z-test (treats all dials as independent Bernoulli trials)
+        y1_tot = sum(l[0] for l in arm1_leads)
+        n1_tot = sum(l[1] for l in arm1_leads)
+        y2_tot = sum(l[0] for l in arm2_leads)
+        n2_tot = sum(l[1] for l in arm2_leads)
+
+        _, p_naive, _, _ = two_proportion_z_test(y1_tot, n1_tot, y2_tot, n2_tot)
+        if p_naive < 0.05:
+            naive_rejections += 1
+
+        # Cluster-robust two-proportion test
+        _, p_clustered, _, _ = cluster_robust_two_proportion_test(arm1_leads, arm2_leads)
+        if p_clustered < 0.05:
+            cluster_rejections += 1
+
+    naive_fpr = naive_rejections / n_sims
+    cluster_fpr = cluster_rejections / n_sims
+
+    # Naive test suffers severe variance deflation from intra-cluster correlation (FPR >= 18%)
+    # Cluster-robust test properly controls FPR near nominal 5% (FPR <= 8%)
+    assert naive_fpr >= 0.18, f"Naive FPR {naive_fpr} was not anti-conservative"
+    assert cluster_fpr <= 0.08, f"Cluster-robust FPR {cluster_fpr} exceeded nominal threshold"
+
