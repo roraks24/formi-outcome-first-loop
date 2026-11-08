@@ -176,3 +176,91 @@ thing you cut.
 - If something is ambiguous, **state your assumption in `SUBMISSION.md` and proceed**. Don't wait for an
   answer. Questions are welcome but won't block you.
 - Don't share the assignment or your solution publicly.
+
+
+---
+
+## 11. Engineering & Operator Guide
+
+### 11.1 Quickstart & Reproduction Commands
+
+```bash
+# 1. Run all unit and integration tests (25 tests covering stats, ingest, idempotency, recovery)
+python -m pytest
+
+# 2. Run public_01_dev end-to-end
+python scripts/run_public_01.py
+
+# 3. Run public_02_incidents end-to-end (tests caller-ID rotation and bad prompt remediation)
+python scripts/run_public_02.py
+
+# 4. Run public_03_load benchmark (tests ingestion and memory throughput at 650k dials/day)
+python scripts/run_public_03.py
+
+# 5. Run the crash-recovery demonstration (simulates kill -9 and seamless recovery)
+python scripts/crash_demo.py # or ./scripts/crash_demo.sh
+```
+
+### 11.2 Controller Main CLI & Single Script Execution
+The controller conforms to `./run.sh <SIM_URL>`:
+```bash
+./run.sh http://127.0.0.1:8700
+```
+Or directly via Python:
+```bash
+python -m controller.main --url http://127.0.0.1:8700 --db runs/controller.db --tick 15
+```
+
+### 11.3 Audit CLI: Answering "Why did workflow X change?"
+The controller persists its causal reasoning in an independent SQLite WAL store. Query any decision using:
+```bash
+python -m controller.audit why --workflow ks_cancel --db runs/mine02/controller.db
+```
+This produces an end-to-end trace detailing:
+1. **Trigger**: Anomaly detection (caller ID drop, hallucination spike) or scheduled experiment.
+2. **Detection Evidence**: Baseline vs. observed rates, p-values, sample sizes.
+3. **Hypothesis & Candidate Selection**: Options considered, synthetic validation run IDs.
+4. **Governance & Approval**: Proposal ID, base version vs. applied version, human vs. auto-apply.
+5. **Applied Version Status**: Resulting live configuration snapshot.
+
+### 11.4 On-Call Runbook & Core Production Alerts
+
+#### Alert 1: `IngestLagSpike`
+- **Condition**: Unprocessed event backlog exceeds 4 ticks (> 60 simulated minutes).
+- **Severity**: **P1 (Page)**
+- **Root Cause**: Database lock contention, network timeout to simulator, or unindexed slow query.
+- **Runbook**:
+  1. Inspect SQLite lock status with `fuser <db_path>` or check active WAL checkpoint locks.
+  2. Verify simulator `/health` endpoint response latency.
+  3. Ensure `events_agg` index on `(workflow_id, sim_day, sim_hour)` is intact.
+
+#### Alert 2: `CreditReserveBreach`
+- **Condition**: Credits remaining drop below 30% of initial tenant allocation.
+- **Severity**: **P1 (Page)**
+- **Root Cause**: Excessive exploratory LLM suggestion calls or high-volume synthetic validation runs.
+- **Runbook**:
+  1. The controller automatically freezes non-incident LLM suggestion calls when credits < 30%.
+  2. Inspect `SELECT * FROM credit_ledger ORDER BY cost DESC LIMIT 10` to identify high-spend workflows.
+  3. Direct urgent prompt remediations to fallback baseline (`P1`) validation.
+
+#### Alert 3: `HighProposalLapseRate`
+- **Condition**: Ratio of lapsed approvals to submitted approvals exceeds 20% over 48 hours.
+- **Severity**: **P2 (Ticket)**
+- **Root Cause**: Approver response time exceeds `apply_window_hours` (e.g. supervisors taking > 2 hours to click approve).
+- **Runbook**:
+  1. Check `SELECT * FROM proposals WHERE status = 'LAPSED'`.
+  2. Notify client operations leads (Anita Desai) regarding review SLA.
+  3. Stage approval notifications directly into Slack / Webhook channels.
+
+### 11.5 Architecture & Module Layout
+- `controller/store.py`: SQLite WAL schema, single-writer atomic transactions, migrations, cursors, write-ahead intents, hourly rollups.
+- `controller/api.py`: Resilient HTTP client with backoff+jitter, typed error handling (402, 403, 409, 410).
+- `controller/ingest.py`: NDJSON chunk streaming, deduplication, O(1) bounded memory rollups.
+- `controller/cohort.py`: Feature-based cohort matching with hierarchical fallback.
+- `controller/stats.py`: Pure mathematical statistics: power sizing, two-proportion z-tests, Holm-Bonferroni correction, SRM detection.
+- `controller/detect.py`: Anomaly and drift detectors (caller ID degradation, hallucination spikes).
+- `controller/experiments.py`: Lead-level randomized A/B experimentation, winner promotion, holdout tracking, decay rollback.
+- `controller/governance.py`: Proposal state machine, approver timing/fatigue protection, auto-apply validation, stale-base detection.
+- `controller/incidents.py`: Automated remediation playbooks for caller ID rotation and prompt fixes.
+- `controller/audit.py`: Human-readable CLI query tool for causal decision audits.
+- `controller/main.py`: Orchestrator loop with startup `recover()`, per-tick advance, and structured telemetry logging.
