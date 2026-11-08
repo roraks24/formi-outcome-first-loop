@@ -93,60 +93,76 @@ def evaluate_caller_id_detector(n_sims: int = 1000) -> tuple[dict, list[dict]]:
 
 
 def evaluate_hallucination_detector(n_sims: int = 1000) -> tuple[dict, list[dict]]:
-    """Evaluates Hallucination Spike Detector."""
-    # Under H0: true hallucination rate p = 0.010 (1.0% benign)
-    # Threshold condition: rate > 0.035 and p_value < 0.001 (vs 1.5% safe upper bound) across 2 consecutive windows.
-    # Connected calls per window: 300 calls
-    p_null = 0.010
-    n_conn = 300
+    """Evaluates Hallucination Spike Detector using data-derived dynamic threshold.
+
+    Baseline rate p_base is empirically derived from historical observed calls (e.g. 0.014).
+    Dynamic threshold = p_base + 3.0 * sqrt(p_base * (1 - p_base) / n_conn).
+    Decision rule: rate > dynamic_threshold AND p_value < 0.001 across 2 consecutive windows.
+    """
+    p_base = 0.014  # empirical BFSI baseline observed on Day 0
+    n_base = 2000   # historical baseline pool size from prior days
+    h_base = int(n_base * p_base)
+
+    window_sizes = [200, 300, 500]
+    injected_rates = [0.014, 0.020, 0.030, 0.040, 0.050, 0.060]
+
+    # Evaluate null FPR across standard window n=300
+    n_default = 300
+    se_null = math.sqrt(p_base * (1.0 - p_base) / n_default)
+    thresh_null = p_base + 3.0 * se_null
 
     h0_single_flags = 0
     h0_consecutive_flags = 0
 
     for _ in range(n_sims):
         # Window 1
-        h1 = sum(1 for _ in range(n_conn) if random.random() < p_null)
-        rate1 = h1 / n_conn
-        _, p1, _, _ = two_proportion_z_test(int(n_conn * 0.015), n_conn, h1, n_conn, alternative="greater")
-        flag1 = rate1 > 0.035 and p1 < 0.001
+        h1 = sum(1 for _ in range(n_default) if random.random() < p_base)
+        rate1 = h1 / n_default
+        _, p1, _, _ = two_proportion_z_test(h_base, n_base, h1, n_default, alternative="greater")
+        flag1 = rate1 > thresh_null and p1 < 0.001
 
         if flag1:
             h0_single_flags += 1
             # Window 2
-            h2 = sum(1 for _ in range(n_conn) if random.random() < p_null)
-            rate2 = h2 / n_conn
-            _, p2, _, _ = two_proportion_z_test(int(n_conn * 0.015), n_conn, h2, n_conn, alternative="greater")
-            if rate2 > 0.035 and p2 < 0.001:
+            h2 = sum(1 for _ in range(n_default) if random.random() < p_base)
+            rate2 = h2 / n_default
+            _, p2, _, _ = two_proportion_z_test(h_base, n_base, h2, n_default, alternative="greater")
+            if rate2 > thresh_null and p2 < 0.001:
                 h0_consecutive_flags += 1
 
     null_res = {
-        "detector": "Hallucination Spike",
+        "detector": "Hallucination Spike (Data-Derived Dynamic Threshold)",
         "nominal_alpha": 0.001,
         "empirical_single_fpr": h0_single_flags / n_sims,
         "empirical_consecutive_fpr": h0_consecutive_flags / n_sims,
     }
 
-    # Injected true hallucination rates
-    rates = [0.010, 0.020, 0.035, 0.050, 0.075, 0.100]
+    # Power table across per-window n and injected rates (4%, 5%, 6% + lower)
     power_rows = []
-    for r in rates:
-        detections = 0
-        for _ in range(n_sims):
-            h1 = sum(1 for _ in range(n_conn) if random.random() < r)
-            rate1 = h1 / n_conn
-            _, p1, _, _ = two_proportion_z_test(int(n_conn * 0.015), n_conn, h1, n_conn, alternative="greater")
+    for n_w in window_sizes:
+        se_w = math.sqrt(p_base * (1.0 - p_base) / n_w)
+        thresh_w = p_base + 3.0 * se_w
 
-            h2 = sum(1 for _ in range(n_conn) if random.random() < r)
-            rate2 = h2 / n_conn
-            _, p2, _, _ = two_proportion_z_test(int(n_conn * 0.015), n_conn, h2, n_conn, alternative="greater")
+        for r in injected_rates:
+            detections = 0
+            for _ in range(n_sims):
+                h1 = sum(1 for _ in range(n_w) if random.random() < r)
+                rate1 = h1 / n_w
+                _, p1, _, _ = two_proportion_z_test(h_base, n_base, h1, n_w, alternative="greater")
 
-            if (rate1 > 0.035 and p1 < 0.001) and (rate2 > 0.035 and p2 < 0.001):
-                detections += 1
+                h2 = sum(1 for _ in range(n_w) if random.random() < r)
+                rate2 = h2 / n_w
+                _, p2, _, _ = two_proportion_z_test(h_base, n_base, h2, n_w, alternative="greater")
 
-        power_rows.append({
-            "injected_halluc_rate": f"{r*100:.1f}%",
-            "empirical_power": detections / n_sims,
-        })
+                if (rate1 > thresh_w and p1 < 0.001) and (rate2 > thresh_w and p2 < 0.001):
+                    detections += 1
+
+            power_rows.append({
+                "window_n": n_w,
+                "dynamic_threshold": f"{thresh_w*100:.2f}%",
+                "injected_halluc_rate": f"{r*100:.1f}%",
+                "empirical_power": detections / n_sims,
+            })
 
     return null_res, power_rows
 
@@ -255,16 +271,18 @@ def main():
 
     report_lines.extend([
         "",
-        "### B. Hallucination Spike Detector",
-        "Evaluates detection probability when a rogue or unvalidated prompt causes hallucinations (baseline safe = 1.0%).",
+        "### B. Hallucination Spike Detector (Data-Derived Dynamic Threshold)",
+        "Evaluates detection probability across per-window sample size n and injected rates (baseline $p_{base} = 1.4\\%$).",
+        "Threshold formula: $p_{thresh} = p_{base} + 3.0 \\cdot \\sqrt{p_{base}(1 - p_{base}) / n}$.",
         "",
-        "| Injected Hallucination Rate | Empirical Power ($1 - \\beta$) | Operational Consequence |",
-        "|---|---|---|",
+        "| Evaluation Window ($n$) | Dynamic Threshold ($p_{thresh}$) | Injected Rate | Empirical Power ($1 - \\beta$) | Detection Status |",
+        "|---|---|---|---|---|",
     ])
 
     for r in hal_pow:
-        status = "Null ($H_0$ compliant)" if r['injected_halluc_rate'] == "1.0%" else ("Acceptable noise" if float(r['injected_halluc_rate'].rstrip('%')) < 3.5 else ("Acute remediation triggered" if r['empirical_power'] > 0.90 else "Emerging anomaly"))
-        report_lines.append(f"| {r['injected_halluc_rate']} | **{r['empirical_power']*100:.1f}%** | {status} |")
+        rate_val = float(r['injected_halluc_rate'].rstrip('%'))
+        status = "Null ($H_0$ baseline)" if rate_val <= 1.4 else ("Sub-threshold variation" if rate_val < 3.0 else ("Acute remediation triggered" if r['empirical_power'] > 0.85 else "Emerging anomaly"))
+        report_lines.append(f"| n = {r['window_n']} | {r['dynamic_threshold']} | {r['injected_halluc_rate']} | **{r['empirical_power']*100:.1f}%** | {status} |")
 
     report_lines.extend([
         "",
