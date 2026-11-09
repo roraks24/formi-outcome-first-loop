@@ -41,6 +41,7 @@ class Experiment:
     required_n_per_arm: int
     status: str
     created_minute: int
+    mde: float = 0.08
     applied_minute: int | None = None
     applied_version: int | None = None
     concluded_minute: int | None = None
@@ -91,6 +92,7 @@ class ExperimentManager:
                 required_n_per_arm=r["required_n_per_arm"],
                 status=r["status"],
                 created_minute=r["created_minute"],
+                mde=float(r["mde"]) if "mde" in r.keys() and r["mde"] is not None else 0.08,
                 applied_minute=r["applied_minute"] if "applied_minute" in r.keys() else None,
                 applied_version=r["applied_version"] if "applied_version" in r.keys() else None,
             )
@@ -310,6 +312,7 @@ class ExperimentManager:
                 required_n_per_arm=required_n,
                 status="PENDING_APPLY",
                 created_minute=sim_minute,
+                mde=float(mde),
                 applied_minute=None,
             )
             self._active_experiments[wid] = exp
