@@ -123,8 +123,9 @@ class IngestPipeline:
                 halluc = 1 if (qa and qa.get("hallucination_flag")) else 0
                 dur = int(ev.get("duration_s") or 0)
                 turns = int(ev.get("turns") or 0)
+                cfg_ver = int(ev.get("config_version") or 1)
 
-                key = (wid, s_day, s_hour, cohort_id, caller_id, welcome, voice, prompt_ver)
+                key = (wid, s_day, s_hour, cohort_id, caller_id, welcome, voice, prompt_ver, cfg_ver)
                 entry = agg_map[key]
                 entry[0] += 1
                 entry[1] += conn
@@ -158,7 +159,7 @@ class IngestPipeline:
         # Convert aggregated counters to flat tuples for executemany
         agg_deltas = [
             (
-                k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+                k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8],
                 v[0], v[1], v[2], v[3], v[4], v[5],
             )
             for k, v in agg_map.items()

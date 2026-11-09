@@ -113,6 +113,17 @@ class Controller:
         cfg = self.api.get_config(wid).get("config", {})
         self.store.save_config_snapshot(wid, ver, actor, minute, cfg)
 
+        # Mark any pending proposals on obsolete base_versions as STALE immediately
+        with self.store.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE proposals
+                SET status = 'STALE'
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING') AND base_version < ?;
+                """,
+                (wid, ver),
+            )
+
         # Invalidate active experiments only if external non-controller actor altered configuration
         if not actor.startswith("controller_"):
             changed_dims = ev.get("changed_dims", [])

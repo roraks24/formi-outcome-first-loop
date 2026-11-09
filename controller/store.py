@@ -42,13 +42,14 @@ MIGRATIONS: list[str] = [
         welcome_message TEXT NOT NULL,
         voice TEXT NOT NULL,
         prompt_version TEXT NOT NULL,
+        config_version INTEGER NOT NULL DEFAULT 1,
         dials INTEGER NOT NULL DEFAULT 0,
         connected INTEGER NOT NULL DEFAULT 0,
         engaged INTEGER NOT NULL DEFAULT 0,
         halluc_flags INTEGER NOT NULL DEFAULT 0,
         duration_s_sum INTEGER NOT NULL DEFAULT 0,
         turns_sum INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (workflow_id, sim_day, sim_hour, cohort_id, caller_id, welcome_message, voice, prompt_version)
+        PRIMARY KEY (workflow_id, sim_day, sim_hour, cohort_id, caller_id, welcome_message, voice, prompt_version, config_version)
     );
 
     -- Bounded lead cache: retained only for recent campaigns (last 2 days) to power dry-runs
@@ -174,6 +175,7 @@ MIGRATIONS: list[str] = [
         mde REAL NOT NULL DEFAULT 0.08,
         created_minute INTEGER NOT NULL,
         applied_minute INTEGER,
+        applied_version INTEGER,
         concluded_minute INTEGER
     );
 
@@ -357,15 +359,20 @@ class Store:
 
             # 2. Upsert hourly aggregated counters
             if agg_deltas:
+                normalized_deltas = [
+                    (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], 1, d[8], d[9], d[10], d[11], d[12], d[13])
+                    if len(d) == 14 else d
+                    for d in agg_deltas
+                ]
                 cur.executemany(
                     """
                     INSERT INTO events_agg (
                         workflow_id, sim_day, sim_hour, cohort_id, caller_id,
-                        welcome_message, voice, prompt_version,
+                        welcome_message, voice, prompt_version, config_version,
                         dials, connected, engaged, halluc_flags,
                         duration_s_sum, turns_sum
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workflow_id, sim_day, sim_hour, cohort_id, caller_id, welcome_message, voice, prompt_version)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(workflow_id, sim_day, sim_hour, cohort_id, caller_id, welcome_message, voice, prompt_version, config_version)
                     DO UPDATE SET
                         dials = dials + excluded.dials,
                         connected = connected + excluded.connected,
@@ -374,7 +381,7 @@ class Store:
                         duration_s_sum = duration_s_sum + excluded.duration_s_sum,
                         turns_sum = turns_sum + excluded.turns_sum;
                     """,
-                    agg_deltas,
+                    normalized_deltas,
                 )
 
             # 3. Store active leads for dry-run backtesting

@@ -141,16 +141,25 @@ class GovernanceEngine:
 
         return True, "permitted"
 
-    def has_pending_proposal(self, workflow_id: str, dim: str | None = None) -> bool:
+    def has_pending_proposal(
+        self,
+        workflow_id: str,
+        dim: str | None = None,
+        base_version: int | None = None,
+    ) -> bool:
         """Checks if there is an active SUBMITTED/PENDING proposal for this workflow."""
         cur = self.store._conn.cursor()
+        ver_clause = "AND base_version >= ?" if base_version is not None else ""
+        params = [workflow_id]
+        if base_version is not None:
+            params.append(base_version)
         if dim:
             cur.execute(
-                """
+                f"""
                 SELECT change_summary, diff_json FROM proposals
-                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING') {ver_clause};
                 """,
-                (workflow_id,),
+                params,
             )
             rows = cur.fetchall()
             cur.close()
@@ -162,11 +171,11 @@ class GovernanceEngine:
             return False
         else:
             cur.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS cnt FROM proposals
-                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING') {ver_clause};
                 """,
-                (workflow_id,),
+                params,
             )
             row = cur.fetchone()
             cur.close()
@@ -376,8 +385,8 @@ class GovernanceEngine:
             status = p_row["status"].lower() if p_row else (i_row["status"].lower() if i_row else "")
             if status in ("submitted", "pending", "approved", "applied"):
                 return appr_proposal_id
-            elif status == "rejected" and is_incident:
-                # Prior incident proposal rejected on judgement call, but incident remains unmitigated.
+            elif status in ("rejected", "expired", "stale") and is_incident:
+                # Prior incident proposal rejected on judgement call, expired or stale, but incident remains unmitigated.
                 # Advance persisted attempt counter (independent of sim_minute).
                 current_attempt = self.store.increment_proposal_attempt(base_proposal_key, sim_ts)
                 appr_proposal_id = f"{base_proposal_key}_att{current_attempt}"
@@ -507,17 +516,17 @@ class GovernanceEngine:
             base_ver = ap["base_version"]
             pid = ap.get("proposal_id", "")
 
+            # Check if we already recorded this proposal as WITHDRAWN, STALE, APPLIED, LAPSED, or EXPIRED locally
+            cur = self.store._conn.cursor()
+            cur.execute("SELECT status FROM proposals WHERE approval_id = ?;", (aid,))
+            row = cur.fetchone()
+            cur.close()
+            if row and row["status"] in ("STALE", "APPLIED", "LAPSED", "EXPIRED", "WITHDRAWN"):
+                continue
+
             # Check if live config is still on base_version
             cur_cfg = self.api.get_config(wid)
             if cur_cfg["version"] != base_ver:
-                # Check if we already recorded this proposal as STALE locally
-                cur = self.store._conn.cursor()
-                cur.execute("SELECT status FROM proposals WHERE approval_id = ?;", (aid,))
-                row = cur.fetchone()
-                cur.close()
-                if row and row["status"] in ("STALE", "APPLIED", "LAPSED", "EXPIRED", "WITHDRAWN"):
-                    continue
-
                 # Live config shifted (e.g. supervisor edit); mark proposal STALE
                 with self.store.transaction() as cur:
                     cur.execute("UPDATE proposals SET status = 'STALE' WHERE approval_id = ?;", (aid,))
@@ -569,10 +578,10 @@ class GovernanceEngine:
                     cur.execute(
                         """
                         UPDATE experiments
-                        SET created_minute = ?
-                        WHERE workflow_id = ? AND status = 'RUNNING';
+                        SET applied_minute = ?, applied_version = ?, status = 'RUNNING'
+                        WHERE workflow_id = ? AND status = 'PENDING_APPLY';
                         """,
-                        (sim_minute, wid),
+                        (sim_minute, new_ver, wid),
                     )
 
                 self.store.record_decision(

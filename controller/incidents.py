@@ -72,8 +72,8 @@ class IncidentHandler:
         if cur_alloc.get(bad_did, 0.0) == 0.0:
             return
 
-        # If a proposal modifying caller_id is already pending approval, do not duplicate
-        if self.governance.has_pending_proposal(wid, dim="caller_id"):
+        # If a proposal modifying caller_id is already pending approval on current base, do not duplicate
+        if self.governance.has_pending_proposal(wid, dim="caller_id", base_version=base_version):
             return
 
         all_dids = spec["options"].get("caller_id", [])

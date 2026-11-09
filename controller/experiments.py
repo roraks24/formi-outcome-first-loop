@@ -42,6 +42,7 @@ class Experiment:
     status: str
     created_minute: int
     applied_minute: int | None = None
+    applied_version: int | None = None
     concluded_minute: int | None = None
     winning_arm: str | None = None
 
@@ -91,6 +92,7 @@ class ExperimentManager:
                 status=r["status"],
                 created_minute=r["created_minute"],
                 applied_minute=r["applied_minute"] if "applied_minute" in r.keys() else None,
+                applied_version=r["applied_version"] if "applied_version" in r.keys() else None,
             )
             self._active_experiments[r["workflow_id"]] = exp
 
@@ -336,19 +338,34 @@ class ExperimentManager:
         applied_minute = exp.applied_minute if exp.applied_minute is not None else exp.created_minute
         exp_start_hour = (applied_minute // 60) + (1 if (applied_minute % 60) != 0 else 0)
         cur = self.store._conn.cursor()
-        cur.execute(
-            f"""
-            SELECT
-                {dim_col} AS arm,
-                SUM(dials) AS dials,
-                SUM(connected) AS connected,
-                SUM(engaged) AS engaged
-            FROM events_agg
-            WHERE workflow_id = ? AND (sim_day * 24 + sim_hour) >= ?
-            GROUP BY {dim_col};
-            """,
-            (wid, exp_start_hour),
-        )
+        if exp.applied_version is not None:
+            cur.execute(
+                f"""
+                SELECT
+                    {dim_col} AS arm,
+                    SUM(dials) AS dials,
+                    SUM(connected) AS connected,
+                    SUM(engaged) AS engaged
+                FROM events_agg
+                WHERE workflow_id = ? AND config_version = ?
+                GROUP BY {dim_col};
+                """,
+                (wid, exp.applied_version),
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT
+                    {dim_col} AS arm,
+                    SUM(dials) AS dials,
+                    SUM(connected) AS connected,
+                    SUM(engaged) AS engaged
+                FROM events_agg
+                WHERE workflow_id = ? AND (sim_day * 24 + sim_hour) >= ?
+                GROUP BY {dim_col};
+                """,
+                (wid, exp_start_hour),
+            )
         rows = cur.fetchall()
         cur.close()
 
@@ -514,13 +531,13 @@ class ExperimentManager:
                 return False
 
         # 1. Sample Ratio Mismatch (SRM) check
-        # Only run Pearson chi-square SRM check on workflows where mid_flight allows immediate cutover;
-        # on next_campaign_only workflows, older in-flight campaigns dial control, creating a heterogeneous mixture.
+        # With config_version filtering, only campaigns dialed under this experiment are included,
+        # ensuring clean random assignment even on next_campaign_only workflows.
         observed_counts = [arm_stats.get(a, {}).get("dials", 0) for a in exp.arms]
         expected_weights = [exp.weights.get(a, 0.25) for a in exp.arms]
         is_srm = False
         srm_p_val = 1.0
-        if workflow_spec.get("mid_flight") != "next_campaign_only" and min(observed_counts) >= 100:
+        if min(observed_counts) >= 60:
             srm_p_val, is_srm = check_sample_ratio_mismatch(observed_counts, expected_weights)
 
         if is_srm:
@@ -625,7 +642,14 @@ class ExperimentManager:
             is_vetoed = res["is_vetoed"]
             g_delta = res["g_delta"]
 
-            decision_str = "WINNER" if (is_sig and not is_vetoed and diff > 0.01) else "GUARDRAIL_VETO" if is_vetoed else "INFERIOR"
+            if is_vetoed:
+                decision_str = "GUARDRAIL_VETO"
+            elif is_sig and diff > 0.01:
+                decision_str = "WINNER"
+            elif diff < -0.02 and p_val > 0.95:
+                decision_str = "INFERIOR"
+            else:
+                decision_str = "INCONCLUSIVE" if (getattr(exp, "mde", 0.08) > 0.20) else "NO_EFFECT" 
 
             # Record analysis row in SQLite
             analysis_id = make_deterministic_key(exp.experiment_id, "ana", {"arm": arm}, sim_minute)
@@ -659,7 +683,8 @@ class ExperimentManager:
             return False
         else:
             # Inconclusive, guardrail vetoed, or no arm beat control: restore 100% control arm
-            self._close_experiment(exp, "NO_EFFECT", None, sim_minute)
+            final_status = "INCONCLUSIVE" if (getattr(exp, "mde", 0.08) > 0.20) else "NO_EFFECT"
+            self._close_experiment(exp, final_status, None, sim_minute)
             cur_cfg_resp = self.governance.api.get_config(wid)
             cur_cfg = cur_cfg_resp["config"]
             base_ver = cur_cfg_resp["version"]
@@ -887,12 +912,12 @@ class ExperimentManager:
         self._active_experiments.pop(exp.workflow_id, None)
 
         # Candidate retirement: permanently retire inferior/no-effect candidates
-        if status in ("NO_EFFECT", "TIMED_OUT"):
+        if status in ("NO_EFFECT", "INCONCLUSIVE", "TIMED_OUT"):
             for t in [a for a in exp.arms if a != exp.control_arm]:
                 self.store.retire_candidate(exp.workflow_id, exp.dim, t, sim_minute, status)
 
-        # Post-experiment cooldown: prevent relaunch on same (workflow, dim) after NO_EFFECT/INVALIDATED/HALTED/TIMED_OUT
-        if status in ("NO_EFFECT", "HALTED", "INVALIDATED", "TIMED_OUT"):
+        # Post-experiment cooldown: prevent relaunch on same (workflow, dim) after NO_EFFECT/INCONCLUSIVE/INVALIDATED/HALTED/TIMED_OUT
+        if status in ("NO_EFFECT", "INCONCLUSIVE", "HALTED", "INVALIDATED", "TIMED_OUT"):
             cooldown_days = 3
             cooldown_min = sim_minute + (cooldown_days * 1440)
             self.store.set_cooldown(exp.workflow_id, exp.dim, cooldown_min, status)
@@ -903,14 +928,15 @@ class ExperimentManager:
         if exp and exp.status == "PENDING_APPLY":
             exp.status = "RUNNING"
             exp.applied_minute = minute
+            exp.applied_version = version
             with self.store.transaction() as cur:
                 cur.execute(
                     """
                     UPDATE experiments
-                    SET status = 'RUNNING', applied_minute = ?
+                    SET status = 'RUNNING', applied_minute = ?, applied_version = ?
                     WHERE experiment_id = ?;
                     """,
-                    (minute, exp.experiment_id),
+                    (minute, version, exp.experiment_id),
                 )
 
     def invalidate_for_workflow(
