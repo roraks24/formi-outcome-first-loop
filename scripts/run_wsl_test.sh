@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/rorak/formi_run
+cd "$HOME/formi_run"
 
-export PATH="/home/rorak/formi_env/bin:$PATH"
-export VIRTUAL_ENV="/home/rorak/formi_env"
+export PATH="$HOME/formi_env/bin:$PATH"
+export VIRTUAL_ENV="$HOME/formi_env"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 

@@ -1,11 +1,11 @@
 import subprocess
 
 cmd = """
-rm -rf /home/rorak/fresh_clone
-mkdir -p /home/rorak/fresh_clone
-git clone /mnt/e/Coding/diwali\\ day\\ hustle /home/rorak/fresh_clone
-cd /home/rorak/fresh_clone
-/home/rorak/.local/share/uv/python/cpython-3.11.18-linux-x86_64-gnu/bin/python3.11 -m venv .venv
+rm -rf $HOME/fresh_clone
+mkdir -p $HOME/fresh_clone
+git clone /mnt/e/Coding/diwali\\ day\\ hustle $HOME/fresh_clone
+cd $HOME/fresh_clone
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m sim baseline --scenario scenarios/public_01_dev.yaml --run-dir runs/base01 > /dev/null 2>&1 || true

@@ -2,7 +2,7 @@ import os
 import subprocess
 import time
 
-CLONE_DIR = "/home/rorak/test_clone"
+CLONE_DIR = os.path.expanduser("~/test_clone")
 os.chdir(CLONE_DIR)
 
 # 1. Baseline
