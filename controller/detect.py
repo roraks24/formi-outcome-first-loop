@@ -232,10 +232,7 @@ class AnomalyDetector:
         active_config: dict[str, Any],
     ) -> list[Detection]:
         """Detects if prompt hallucination rate spikes beyond empirical baseline."""
-        # Burn-in discipline: Day 0 establishes workflow baseline
-        if sim_day < 1:
-            return []
-
+        # Day-0 suppression removed to detect early bad prompts on Day 0
         cur = self.store._conn.cursor()
         # Query hallucination counts for current prompt in trailing 24 hours
         prompt_ver = active_config.get("prompt_version")
@@ -264,31 +261,42 @@ class AnomalyDetector:
 
         rate = halluc / conn
 
-        # Derive baseline from observed historical data (prior days or other prompt versions)
+        # Derive baseline from prior versions or pooled healthy versions (rate <= 0.02)
         cur = self.store._conn.cursor()
         cur.execute(
             """
-            SELECT SUM(connected) AS base_conn, SUM(halluc_flags) AS base_halluc
+            SELECT prompt_version, SUM(connected) AS base_conn, SUM(halluc_flags) AS base_halluc
             FROM events_agg
-            WHERE workflow_id = ? AND (sim_day < ? OR prompt_version != ?);
+            WHERE workflow_id = ? AND prompt_version != ?
+            GROUP BY prompt_version;
             """,
-            (workflow_id, sim_day, prompt_ver),
+            (workflow_id, prompt_ver),
         )
-        base_row = cur.fetchone()
+        prior_rows = cur.fetchall()
         cur.close()
 
-        base_conn = int((base_row and base_row["base_conn"]) or 0)
-        base_halluc = int((base_row and base_row["base_halluc"]) or 0)
+        healthy_conn = 0
+        healthy_halluc = 0
+        for r in prior_rows:
+            c = int(r["base_conn"] or 0)
+            h = int(r["base_halluc"] or 0)
+            if c >= 50 and (h / c) <= 0.02:
+                healthy_conn += c
+                healthy_halluc += h
 
-        # Baseline rate p_base directly observed from data (or empirical reference if cold-starting)
-        if base_conn >= 50:
-            p_base = max(0.005, base_halluc / base_conn)
-            k1_pool = base_halluc
-            n1_pool = base_conn
+        if healthy_conn >= 50:
+            p_base = max(0.005, healthy_halluc / healthy_conn)
+            k1_pool = healthy_halluc
+            n1_pool = healthy_conn
+            base_conn = healthy_conn
+            base_halluc = healthy_halluc
         else:
+            # Empirical reference baseline for healthy production prompt (1.4% standard)
             p_base = 0.014
             k1_pool = int(conn * p_base)
             n1_pool = conn
+            base_conn = conn
+            base_halluc = k1_pool
 
         # Two-proportion z-test comparing recent window vs empirical baseline pool
         z, p_val, diff, _ = two_proportion_z_test(

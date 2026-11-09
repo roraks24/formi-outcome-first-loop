@@ -32,10 +32,10 @@ Always-on closed-loop controller that optimizes voice workflows via rigorous dri
 | **C4** | Call-Time Optimisation | **Partial** | Respects dialing windows and hourly volume limits; tracks hour-level response distributions in rollups. | Full Bayesian lead-level preferred contact hour scoring. |
 | **C5** | Caller-ID Health | **Built** | Detects degradation controlling for hour-of-day mix vs peers; rotates traffic to healthy DIDs with 0.0% traffic on degraded lines. | Complete. Verified in `public_02_incidents`. |
 | **C6** | Variant Experiments | **Built** | Lead-level randomization, statistical power sample sizing (MDE 8%), SRM checks, Holm-Bonferroni multiple testing control. | Complete. Passed on public_01 and public_02. |
-| **C7** | Promotion & Decay | **Built** | Winner promotion with 20% holdout control arm; CUSUM decay detection triggers automatic rollback to baseline. | Complete. Verified in `public_02_incidents`. |
+| **C7** | Promotion & Decay | **Built** | Winner promotion with 20% holdout control arm; two-proportion z-test decay detection triggers automatic rollback to baseline. | Complete. Verified in `public_02_incidents`. |
 | **C8** | Hallucination Incident | **Built** | Detects acute spikes (>3.5%, p<0.001), queries LLM suggestions, runs synthetic validation (pass rate >=97%), proposes with evidence. | Complete. MTTR 300m, 0 harmful changes. |
 | **C9** | Governance Engine | **Built** | State machine (DRAFT->SUBMITTED->APPROVED->APPLIED/STALE), write-ahead intents, approver fatigue throttling (<=2 req/24h), standup sync. | Complete. Zero duplicate applies or stale collisions. |
-| **C10** | Impact Scores & Dry-Run | **Built** | Pre-computes affected lead count, configuration diff, expected lift, and dry-run JSON payload for all proposals. | Complete. Auditable in decision ledger. |
+| **C10** | Priority Tiers & Dry-Run | **Built** | Pre-computes affected lead count (with 95% CI), configuration diff, priority tier (Tier 1 incident 0.7-0.9 to Tier 4 routine 0.2-0.35), lift, and dry-run JSON payload for all proposals. | Complete. Auditable in decision ledger. |
 | **C11** | Supervisor UI View | **Partial** | Full CLI audit tool (`python -m controller.audit why`) providing end-to-end causal chain from detection to outcome. | Web UI dashboard wrapping SQLite read replicas. |
 | **C12** | Audit Decision Store | **Built** | Queryable SQLite WAL tables: `intents`, `proposals`, `decisions`, `detections`, `config_snapshots`, `credit_ledger`. | Complete. Audits any decision with full context. |
 | **C13** | Crash Recovery Demo | **Built** | Automated test suite and demonstration script (`scripts/crash_demo.py`) proving resume without data loss after `kill -9`. | Complete. Verified and logged in `reports/crash_recovery.log`. |
@@ -65,7 +65,7 @@ Our architectural mandate prioritizes a correct, defensible, crash-safe floor ov
 
 ### Memo 03: Rajesh Sundaram (Head of Digital Marketing & Growth, Kestrel Loans)
 - **Accepted**: Automated multi-variant testing on welcome messages and voices with Holm-Bonferroni correction, statistical sample sizing for MDE 8%, and automatic winner promotion with a 20% holdout arm.
-- **Declined**: Rajesh wanted to aggregate pickup rate and engagement rate into a blended conversion metric. We declined because pickup and engagement represent independent funnels; blending them obscures caller-ID degradation and produces false winners.
+- **Declined**: Rajesh wanted to aggregate pickup rate and engagement rate into a blended conversion metric. We declined because pickup rate (connected/dials) and engagement rate (engaged/connected) represent independent funnels; blending them obscures caller-ID degradation and produces false winners.
 - **Contract/Policy Inconsistency**: Rajesh claimed that winner promotion should be instantaneous upon reaching a 5% point difference. In reality, testing without fixed sample sizes and multiple testing corrections yields a ~30% false discovery rate.
 - **Ready-to-Paste Reply (116 words)**:
   > Hi Rajesh, our experimentation engine has delivered outstanding growth on Kestrel workflows: on `ks_cancel`, we achieved a +54.3% lift in conclusion rate, +36.7% in pickup rate, and +7.7% in engagement rate, capturing 36% of the theoretical gap. We test voice and welcome message variants against statistical power targets (MDE 8%, $\alpha=0.05$, $1-\beta=0.80$) with Holm-Bonferroni correction to eliminate false positives. We maintain pickup and engagement as separate funnels to ensure voice improvements do not mask delivery issues. Winners are automatically promoted with a 20% holdout arm to track decay, giving you aggressive yield optimization backed by rock-solid statistical rigor.
@@ -172,16 +172,16 @@ Cohorts partition leads by immutable demographic traits: language (`hi`, `en`, `
 - **Dimensional Isolation**: Experiments test one dimension at a time (`voice` first, followed by `welcome_message`) to avoid non-linear interaction confounding. Supervisor edits immediately invalidate active experiments on the modified dimension.
 
 ### Deciding a Winner
-- **Statistical Power**: Required sample size $n$ per arm is determined a priori using standard power calculations:
-  $$n = \frac{2 \cdot (z_{\alpha/2} + z_{\beta})^2 \cdot p(1-p)}{\text{MDE}^2}$$
-  with baseline rate $p$, $\alpha=0.05$ ($z_{0.025}=1.96$), and power $1-\beta=0.80$ ($z_{0.20}=0.84$).
+- **Statistical Power & Dynamic MDE**: Sample size $n$ and Minimum Detectable Effect (MDE) are computed dynamically from baseline rate $p$ and achievable sample size $N_{\text{achievable}}$ (targeting 80% power at $\alpha=0.05$):
+  $$\text{MDE} = (z_{\alpha/2} + z_{\beta}) \sqrt{\frac{2 p (1-p)}{N_{\text{achievable}}}}, \quad n = \frac{2 \cdot (z_{\alpha/2} + z_{\beta})^2 \cdot p(1-p)}{\text{MDE}^2}$$
+  with $z_{\alpha/2}=1.96$ and $z_{\beta}=0.84$. This replaces any static MDE assumptions with an exact empirical bound per workflow.
 - **Hypothesis Testing**: Two-proportion z-test comparing treatment vs. control:
   $$z = \frac{\hat{p}_t - \hat{p}_c}{\sqrt{\hat{p}(1-\hat{p})(1/n_t + 1/n_c)}}$$
-- **Multiple Testing Correction**: Holm-Bonferroni adjustment across all treatment arms: candidate p-values are sorted $p_{(1)} \le p_{(2)} \dots \le p_{(m)}$ and tested sequentially against $\alpha / (m - i + 1)$.
-- **False-Winner Control**: Family-wise error rate is strictly capped at $\alpha = 0.05$.
+- **Multiple Testing Correction**: Holm-Bonferroni step-down adjustment across candidate treatment arms: candidate p-values are sorted $p_{(1)} \le p_{(2)} \dots \le p_{(m)}$ and tested sequentially against $\alpha / (m - i + 1)$. This guarantees Family-Wise Error Rate (FWER) $\le 0.05$ at experiment conclusion across multiple treatments.
+- **Early Harm-Stop (Alpha Spending)**: During the experiment run, conservative one-sided interim looks are evaluated. To prevent bleeding on inferior variants without inflating false halts, interim looks use a conservative alpha spending boundary ($\alpha_{\text{interim}} = 0.01$). If a candidate treatment exhibits statistically significant degradation on primary KPI ($\Delta < -0.02, p < 0.01$) or breaches the guardrail drop threshold ($p < 0.01$), the arm is halted immediately, reverting allocation to 100% control.
 
 ### Decay and Rollback
-Promoted winners retain a **20% holdout control arm**. Promoted variants are monitored using CUSUM and two-proportion testing with a 2-day minimum burn-in. If the winner's performance drops below the holdout control by $>2.0\%$ ($p < 0.05$), the controller immediately stages a rollback proposal restoring the baseline configuration.
+Promoted winners retain a **20% holdout control arm**. Promoted variants are continuously monitored against the holdout control arm using two-proportion z-tests with a 2-day minimum burn-in ($n_{\text{holdout}} \ge 60$). If the winner's performance drops below the holdout control by $\Delta < -0.02$ ($p < 0.05$), the controller immediately stages a rollback proposal restoring the baseline configuration.
 
 ### Guardrail KPI Protection
 The workflow guardrail (e.g. pickup rate drop $\le 0.02$) acts as a non-negotiable statistical veto:
@@ -208,8 +208,8 @@ If the guardrail drops significantly, the treatment is disqualified regardless o
 ```
 
 ### Batching, Timing, and Fatigue Discipline
-- **Approver Hours**: Submissions are permitted strictly between 11:00 and 17:00 IST, honoring Anita Desai's morning operations standups.
-- **Fatigue Protection**: Proposals are throttled to $\le 2$ requests per 24-hour window per workflow (`max_requests_per_24h`). Urgent incident remediations (impact score $\ge 0.70$) are prioritized over routine exploratory experiments.
+- **Approver Hours**: Approver windows are read dynamically from each workflow's `governance.approver_hours` policy contract (e.g., [11, 17] for `ks_cancel`, honoring Anita Desai's morning operations standup; [10, 18] for others). Submissions outside these hours are deferred until approvers are online.
+- **Fatigue Protection**: Proposals are dynamically throttled to `max_requests_per_24h` defined in each workflow's `governance` policy (typically 2 to 5 requests per rolling 24h window). The controller reserves the final request slot exclusively for urgent incidents (caller-ID degradation, hallucination spikes), ensuring routine experiments never exhaust approver bandwidth.
 - **Apply Window**: Approved proposals must be applied within `apply_window_hours` (2 hours); stale or lapsed approvals are never re-applied.
 
 ### Auto-Apply Boundary
@@ -309,8 +309,8 @@ Outcome: submitted_approval_apr_00004
    - Status: APPLIED | Auto-Apply: False
    - Change Summary: Rotate caller ID on ks_cancel: disable degraded D2, use D1, D3
    - Diff: {"allocations.default.caller_id": {"old": {"D1": 0.5, "D2": 0.5}, "new": {"D1": 0.5, "D3": 0.5}}}
-   - Impact Score: 0.4 | Affected Leads: 1500
-   - Rationale: Pickup rate on D2 dropped to 0.201 vs peer baseline 0.248 (p=0.0). Rotating traffic to healthy DIDs ['D1', 'D3'].
+   - Priority Tier: 0.70 (Tier 1 - Incident Remediation) | Affected Leads: 1500 ± 78 (95% CI)
+   - Rationale: Pickup rate on D2 dropped to 0.201 vs peer baseline 0.248 (p=0.0). Expected gain: +0.047 lift on 1500 ± 78 leads (~70.5 ± 3.7 connects/day). Rotating traffic to healthy DIDs ['D1', 'D3'].
    - Reasons / Feedback: []
 
 5. APPLIED CONFIGURATION STATUS:

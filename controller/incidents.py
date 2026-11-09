@@ -112,10 +112,12 @@ class IncidentHandler:
             change_summary=change_summary,
             rationale=rationale,
             affected_leads=spec.get("daily_batch", {}).get("size", 1000),
-            impact_score=0.40,
+            impact_score=0.80,
             dry_run=dry_run,
             sim_minute=sim_minute,
             sim_ts=sim_ts,
+            is_incident=True,
+            detection_id=det.detection_id,
         )
 
     # --------------------------------------------------------------------------
@@ -145,19 +147,78 @@ class IncidentHandler:
             return
 
         gov = spec.get("governance", {})
-        min_pass_rate = float(gov.get("min_validation_pass_rate", 0.95))
+        min_pass_rate = float(gov.get("min_validation_pass_rate") or 0.97)
         available_prompts = spec.get("options", {}).get("prompt_version", [])
-        baseline_prompt = available_prompts[0] if available_prompts else cur_cfg.get("prompt_version")
+        prim_metric = spec.get("objective", {}).get("primary", "engagement_rate")
+        
+        # 1. Identify last known-good prompt from history and evaluate rollback baseline
+        cur = self.store._conn.cursor()
+        cur.execute(
+            """
+            SELECT prompt_version, SUM(connected) AS conn, SUM(engaged) AS eng, SUM(halluc_flags) AS halluc
+            FROM events_agg
+            WHERE workflow_id = ? AND prompt_version != ?
+            GROUP BY prompt_version;
+            """,
+            (wid, bad_prompt),
+        )
+        history_prompts = cur.fetchall()
+        cur.close()
+
+        hist_performance: dict[str, dict[str, Any]] = {}
+        for hp in history_prompts:
+            pv = hp["prompt_version"]
+            c = int(hp["conn"] or 0)
+            e = int(hp["eng"] or 0)
+            h = int(hp["halluc"] or 0)
+            rate = (e / c) if c > 0 else None
+            hist_performance[pv] = {
+                "conn": c,
+                "eng": e,
+                "halluc": h,
+                "halluc_rate": (h / c) if c > 0 else 0.0,
+                "primary_rate": rate,
+            }
+
+        last_good_prompt = None
+        last_good_primary_rate = None
+        last_good_n = 0
+        for pv, perf in hist_performance.items():
+            if perf["conn"] >= 50 and perf["halluc_rate"] <= 0.02:
+                last_good_prompt = pv
+                last_good_primary_rate = perf["primary_rate"]
+                last_good_n = perf["conn"]
+                break
+
+        if not last_good_prompt:
+            last_good_prompt = available_prompts[0] if available_prompts else "P1"
 
         # Check credits remaining from sim state
         state = self.governance.api.get_state()
         credits_rem = float(state.get("credits_remaining", 0.0))
         if credits_rem < 8.0:
             # Credit reserve floor: cannot spend on LLM calls; rollback to baseline prompt directly
-            self._rollback_prompt_safe(spec, base_version, cur_cfg, baseline_prompt, sim_minute, sim_ts, det)
+            self._rollback_prompt_safe(spec, base_version, cur_cfg, last_good_prompt, sim_minute, sim_ts, det)
             return
 
-        # 1. Ask LLM for suggestions (Costs 3 credits)
+        # Validate last known-good rollback option
+        rollback_val_id = None
+        rollback_pass_rate = 0.0
+        try:
+            rb_res = self.governance.api.run_validation(
+                workflow_id=wid,
+                prompt_version=last_good_prompt,
+                n=200,
+                sim_minute=sim_minute,
+                sim_ts=sim_ts,
+                tenant_id=spec.get("tenant_id", ""),
+            )
+            rollback_pass_rate = float(rb_res.get("pass_rate", 0.0))
+            rollback_val_id = rb_res.get("validation_run_id")
+        except Exception:
+            pass
+
+        # 2. Ask LLM for suggestions (Costs 3 credits)
         try:
             fixes_resp = self.governance.api.suggest_fixes(
                 workflow_id=wid,
@@ -170,13 +231,12 @@ class IncidentHandler:
         except Exception:
             suggestions = []
 
-        chosen_prompt = None
-        chosen_val_id = None
-        chosen_pass_rate = 0.0
-
-        # 2. Run synthetic validation on candidate suggestions (Costs 2 credits each)
+        # 3. Run synthetic validation on candidate suggestions (Costs 2 credits each)
+        candidate_evals: list[dict[str, Any]] = []
         for s in suggestions:
             cand = s["prompt_version"]
+            if cand == bad_prompt:
+                continue
             try:
                 val_res = self.governance.api.run_validation(
                     workflow_id=wid,
@@ -188,31 +248,83 @@ class IncidentHandler:
                 )
                 pass_rate = float(val_res.get("pass_rate", 0.0))
                 val_id = val_res.get("validation_run_id")
-                if pass_rate >= min_pass_rate:
-                    chosen_prompt = cand
-                    chosen_val_id = val_id
-                    chosen_pass_rate = pass_rate
-                    break
+                cand_perf = hist_performance.get(cand, {})
+                candidate_evals.append({
+                    "prompt_version": cand,
+                    "validation_run_id": val_id,
+                    "validation_pass_rate": pass_rate,
+                    "is_compliant": pass_rate >= min_pass_rate,
+                    "measured_primary_kpi": cand_perf.get("primary_rate"),
+                    "measured_n": cand_perf.get("conn", 0),
+                    "summary": s.get("summary", ""),
+                })
             except Exception:
                 continue
 
-        # If no suggestion passed, validate baseline prompt
-        if not chosen_prompt:
-            try:
-                val_res = self.governance.api.run_validation(
-                    workflow_id=wid,
-                    prompt_version=baseline_prompt,
-                    n=200,
-                    sim_minute=sim_minute,
-                    sim_ts=sim_ts,
-                    tenant_id=spec.get("tenant_id", ""),
+        # 4. Remediation Selection Policy:
+        # Choose candidate with best expected PRIMARY KPI among those meeting min_validation_pass_rate.
+        # Prefer known-good rollback (measured data) over LLM candidates unless a candidate has validated
+        # evidence of better primary KPI.
+        rollback_compliant = rollback_pass_rate >= min_pass_rate
+        chosen_prompt = None
+        chosen_val_id = None
+        chosen_pass_rate = 0.0
+        policy_reason = ""
+
+        compliant_cands = [c for c in candidate_evals if c["is_compliant"]]
+
+        if rollback_compliant:
+            better_candidate = None
+            if last_good_primary_rate is not None:
+                for c in compliant_cands:
+                    if c["measured_primary_kpi"] is not None and c["measured_n"] >= 50:
+                        if c["measured_primary_kpi"] > last_good_primary_rate:
+                            better_candidate = c
+                            break
+
+            if better_candidate:
+                chosen_prompt = better_candidate["prompt_version"]
+                chosen_val_id = better_candidate["validation_run_id"]
+                chosen_pass_rate = better_candidate["validation_pass_rate"]
+                policy_reason = (
+                    f"Candidate {chosen_prompt} selected: demonstrated superior validated primary KPI "
+                    f"({better_candidate['measured_primary_kpi']:.3f} vs rollback {last_good_primary_rate:.3f}) "
+                    f"while meeting compliance threshold ({chosen_pass_rate*100:.1f}% >= {min_pass_rate*100:.1f}%)."
                 )
-                if float(val_res.get("pass_rate", 0.0)) >= min_pass_rate:
-                    chosen_prompt = baseline_prompt
-                    chosen_val_id = val_res.get("validation_run_id")
-                    chosen_pass_rate = float(val_res.get("pass_rate", 0.0))
-            except Exception:
-                pass
+            else:
+                chosen_prompt = last_good_prompt
+                chosen_val_id = rollback_val_id
+                chosen_pass_rate = rollback_pass_rate
+                cands_summary_str = ", ".join([f"{c['prompt_version']}(pass={c['validation_pass_rate']*100:.1f}%, primary=unmeasured)" for c in compliant_cands]) or "none"
+                meas_kpi_str = f"{last_good_primary_rate:.3f} (N={last_good_n})" if last_good_primary_rate is not None else "baseline"
+                policy_reason = (
+                    f"Known-good rollback {last_good_prompt} selected: meets compliance ({rollback_pass_rate*100:.1f}% >= {min_pass_rate*100:.1f}%) "
+                    f"and has verified production performance ({prim_metric}={meas_kpi_str}). "
+                    f"Compliant LLM candidates [{cands_summary_str}] lack validated evidence of superior primary KPI; "
+                    f"policy strictly prefers measured rollback over unverified LLM suggestions."
+                )
+        else:
+            if compliant_cands:
+                best_cand = max(
+                    compliant_cands,
+                    key=lambda c: (c["measured_primary_kpi"] if c["measured_primary_kpi"] is not None else -1.0, c["validation_pass_rate"]),
+                )
+                chosen_prompt = best_cand["prompt_version"]
+                chosen_val_id = best_cand["validation_run_id"]
+                chosen_pass_rate = best_cand["validation_pass_rate"]
+                meas_str = f", primary={best_cand['measured_primary_kpi']:.3f}" if best_cand["measured_primary_kpi"] is not None else ", primary=unmeasured"
+                policy_reason = (
+                    f"Rollback {last_good_prompt} breached compliance threshold (pass rate {rollback_pass_rate*100:.1f}% < {min_pass_rate*100:.1f}%). "
+                    f"Compliant candidate {chosen_prompt} selected (pass rate {chosen_pass_rate*100:.1f}% >= {min_pass_rate*100:.1f}%{meas_str})."
+                )
+            elif rollback_val_id:
+                chosen_prompt = last_good_prompt
+                chosen_val_id = rollback_val_id
+                chosen_pass_rate = rollback_pass_rate
+                policy_reason = (
+                    f"No candidate met compliance threshold {min_pass_rate*100:.1f}%. Falling back to rollback {last_good_prompt} "
+                    f"(pass rate {rollback_pass_rate*100:.1f}%)."
+                )
 
         if not chosen_prompt or not chosen_val_id:
             return
@@ -226,8 +338,7 @@ class IncidentHandler:
         change_summary = f"Remediate hallucination on {wid}: replace {bad_prompt} with validated {chosen_prompt}"
         rationale = (
             f"Hallucination spike on {bad_prompt} reached {det.current_val*100:.1f}%. "
-            f"Replacement {chosen_prompt} validated with pass rate {chosen_pass_rate*100:.1f}% "
-            f"(run {chosen_val_id}) meeting compliance threshold {min_pass_rate*100:.1f}%."
+            f"{policy_reason}"
         )
 
         dry_run = {
@@ -235,6 +346,9 @@ class IncidentHandler:
             "bad_prompt": bad_prompt,
             "chosen_prompt": chosen_prompt,
             "validation_pass_rate": chosen_pass_rate,
+            "rollback_option": last_good_prompt,
+            "rollback_pass_rate": rollback_pass_rate,
+            "policy_decision": "rollback_preferred_over_unmeasured_llm_candidates" if chosen_prompt == last_good_prompt else "compliant_llm_candidate_selected",
         }
 
         self.governance.submit_proposal(
@@ -248,7 +362,12 @@ class IncidentHandler:
             dry_run=dry_run,
             sim_minute=sim_minute,
             sim_ts=sim_ts,
-            evidence={"validation_run_id": chosen_val_id},
+            is_incident=True,
+            detection_id=det.detection_id,
+            evidence={
+                "validation_run_id": chosen_val_id,
+                "rollback_validation_run_id": rollback_val_id,
+            },
         )
 
     def _rollback_prompt_safe(

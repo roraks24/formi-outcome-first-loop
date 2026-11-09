@@ -1,13 +1,11 @@
-"""Crash-recovery demonstration script with three kill points (C13).
+"""Crash-recovery demonstration script across four kill points (C13).
 
-Demonstrates resilience across all three critical failure points:
+Demonstrates resilience across all four critical failure points:
   1. Kill Point 1 (Mid-Ingest): Killed after chunk commit. Resumes from persisted cursor with 0 duplicate events.
-  2. Kill Point 2 (Between Submit and Recording): Killed after HTTP POST /approvals succeeds before DB record.
-     Resumes via recover(): reconciles pending intent against simulator, preserves pending approval, 0 duplicates.
-  3. Kill Point 3 (Between Apply and Recording): Killed after HTTP POST /workflows/{id}/apply succeeds before DB record.
-     Resumes via recover(): reconciles applied version against live config, marks APPLIED, 0 duplicate apply.
-  4. Final run to completion: Verifies applied changes equal an uninterrupted run, zero duplicate applies,
-     and pending approvals preserved.
+  2. Kill Point 2 (Pre-Submit Intent): Killed after decision logging and write-ahead intent recorded, before HTTP POST. Resumes and dispatches unexecuted intent.
+  3. Kill Point 3 (Post-Submit / Pre-Record): Killed after HTTP POST /approvals succeeds before DB proposal record. Resumes via recover(): reconciles pending intent against simulator, preserves pending approval, 0 duplicate proposals.
+  4. Kill Point 4 (Post-Apply / Pre-Record): Killed after HTTP POST /workflows/{id}/apply succeeds before DB record. Resumes via recover(): reconciles applied version against live config, marks APPLIED, 0 duplicate apply.
+  5. Final run to completion: Verifies applied changes equal an uninterrupted run, zero duplicate applies, and pending approvals preserved.
 """
 from __future__ import annotations
 
@@ -48,6 +46,7 @@ def run_controller_step(
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["ENABLE_TEST_CRASH_HOOKS"] = "1"
     env.update(env_extra)
     p = subprocess.Popen(cmd, env=env)
     try:
@@ -79,7 +78,7 @@ def main():
             log.flush()
 
         log_p("=" * 80)
-        log_p("CRASH-RECOVERY DEMONSTRATION ACROSS THREE KILL POINTS (C13)")
+        log_p("CRASH-RECOVERY DEMONSTRATION ACROSS MULTIPLE KILL POINTS (C13)")
         log_p("Scenario: public_01_dev | Storage: SQLite WAL with Write-Ahead Intents")
         log_p("=" * 80)
 
@@ -97,7 +96,7 @@ def main():
             str(sim_port),
             "--force",
         ]
-        log_p(f"[SETUP] Launching simulator: {' '.join(server_cmd)}")
+        log_p(f"[SETUP] Launching simulator: python -m sim serve --scenario {scenario} --run-dir {run_dir} --port {sim_port} --force")
         server_proc = subprocess.Popen(server_cmd)
 
         try:

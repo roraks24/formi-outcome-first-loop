@@ -124,6 +124,13 @@ MIGRATIONS: list[str] = [
         rejection_reasons_json TEXT
     );
 
+    -- Persisted attempt counter for retry/idempotency keys (crash/restart safe across minutes)
+    CREATE TABLE IF NOT EXISTS proposal_attempts (
+        base_proposal_key TEXT PRIMARY KEY,
+        attempt_count INTEGER NOT NULL DEFAULT 1,
+        last_updated_ts TEXT NOT NULL
+    );
+
     -- Configuration snapshot history
     CREATE TABLE IF NOT EXISTS config_snapshots (
         workflow_id TEXT NOT NULL,
@@ -166,6 +173,7 @@ MIGRATIONS: list[str] = [
         power REAL NOT NULL DEFAULT 0.80,
         mde REAL NOT NULL DEFAULT 0.08,
         created_minute INTEGER NOT NULL,
+        applied_minute INTEGER,
         concluded_minute INTEGER
     );
 
@@ -212,6 +220,25 @@ MIGRATIONS: list[str] = [
         promoted_rate REAL NOT NULL,
         status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE, ROLLED_BACK
         PRIMARY KEY (workflow_id, cohort_id, dim)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS experiment_cooldowns (
+        workflow_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        cooldown_until_minute INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (workflow_id, dim)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS retired_candidates (
+        workflow_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        candidate TEXT NOT NULL,
+        retired_at_minute INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (workflow_id, dim, candidate)
     );
     """,
 ]
@@ -509,6 +536,38 @@ class Store:
         cur.close()
         return rows
 
+    def get_or_create_proposal_attempt(self, base_key: str, sim_ts: str) -> int:
+        """Returns the current attempt count for a base proposal key."""
+        with self.transaction() as cur:
+            cur.execute("SELECT attempt_count FROM proposal_attempts WHERE base_proposal_key = ?;", (base_key,))
+            row = cur.fetchone()
+            if row:
+                return int(row["attempt_count"])
+            cur.execute(
+                "INSERT OR IGNORE INTO proposal_attempts (base_proposal_key, attempt_count, last_updated_ts) VALUES (?, 1, ?);",
+                (base_key, sim_ts),
+            )
+            return 1
+
+    def increment_proposal_attempt(self, base_key: str, sim_ts: str) -> int:
+        """Increments and returns the next attempt count for a rejected proposal."""
+        with self.transaction() as cur:
+            cur.execute("SELECT attempt_count FROM proposal_attempts WHERE base_proposal_key = ?;", (base_key,))
+            row = cur.fetchone()
+            if row:
+                new_count = int(row["attempt_count"]) + 1
+                cur.execute(
+                    "UPDATE proposal_attempts SET attempt_count = ?, last_updated_ts = ? WHERE base_proposal_key = ?;",
+                    (new_count, sim_ts, base_key),
+                )
+            else:
+                new_count = 2
+                cur.execute(
+                    "INSERT INTO proposal_attempts (base_proposal_key, attempt_count, last_updated_ts) VALUES (?, 2, ?);",
+                    (base_key, sim_ts),
+                )
+            return new_count
+
     # --------------------------------------------------------------------------
     # Config Snapshots
     # --------------------------------------------------------------------------
@@ -598,7 +657,7 @@ class Store:
         with self.transaction() as cur:
             cur.execute(
                 """
-                INSERT INTO decisions (
+                INSERT OR REPLACE INTO decisions (
                     decision_id, sim_minute, ts, workflow_id, decision_type,
                     inputs_ref_json, numbers_json, policy_clause, outcome
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
@@ -671,3 +730,128 @@ class Store:
                 """,
                 (workflow_id, cohort_id, dim),
             )
+
+    # --------------------------------------------------------------------------
+    # Experiment Cooldowns
+    # --------------------------------------------------------------------------
+
+    def is_in_cooldown(self, workflow_id: str, dim: str, sim_minute: int) -> bool:
+        """Checks if a workflow dimension is under active post-experiment cooldown."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT cooldown_until_minute FROM experiment_cooldowns
+            WHERE workflow_id = ? AND dim = ?;
+            """,
+            (workflow_id, dim),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row and int(row["cooldown_until_minute"]) > sim_minute:
+            return True
+        return False
+
+    def set_cooldown(
+        self,
+        workflow_id: str,
+        dim: str,
+        cooldown_until_minute: int,
+        reason: str,
+    ) -> None:
+        """Sets or updates a cooldown on (workflow_id, dim)."""
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO experiment_cooldowns (workflow_id, dim, cooldown_until_minute, reason)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(workflow_id, dim) DO UPDATE SET
+                    cooldown_until_minute = excluded.cooldown_until_minute,
+                    reason = excluded.reason;
+                """,
+                (workflow_id, dim, cooldown_until_minute, reason),
+            )
+
+    # --------------------------------------------------------------------------
+    # Candidate Retirement & Incident Querying
+    # --------------------------------------------------------------------------
+
+    def retire_candidate(
+        self,
+        workflow_id: str,
+        dim: str,
+        candidate: str,
+        sim_minute: int,
+        reason: str,
+    ) -> None:
+        """Permanently retires an inferior/non-effective candidate from future trials."""
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO retired_candidates (workflow_id, dim, candidate, retired_at_minute, reason)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(workflow_id, dim, candidate) DO UPDATE SET
+                    retired_at_minute = excluded.retired_at_minute,
+                    reason = excluded.reason;
+                """,
+                (workflow_id, dim, candidate, sim_minute, reason),
+            )
+
+    def is_candidate_retired(
+        self,
+        workflow_id: str,
+        dim: str,
+        candidate: str,
+    ) -> bool:
+        """Checks if a specific candidate variant has been retired on this workflow dimension."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT 1 FROM retired_candidates
+            WHERE workflow_id = ? AND dim = ? AND candidate = ?;
+            """,
+            (workflow_id, dim, candidate),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return row is not None
+
+    def get_retired_candidates(
+        self,
+        workflow_id: str,
+        dim: str,
+    ) -> set[str]:
+        """Returns all retired candidates for a workflow dimension."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT candidate FROM retired_candidates
+            WHERE workflow_id = ? AND dim = ?;
+            """,
+            (workflow_id, dim),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0] for r in rows}
+
+    def has_open_incident(self, workflow_id: str | None = None) -> bool:
+        """Checks if there is an active unhandled detection or pending incident proposal."""
+        cur = self._conn.cursor()
+        if workflow_id:
+            cur.execute(
+                """
+                SELECT 1 FROM proposals 
+                WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING') AND impact_score >= 0.70;
+                """,
+                (workflow_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT 1 FROM proposals 
+                WHERE status IN ('SUBMITTED', 'PENDING') AND impact_score >= 0.70;
+                """
+            )
+        row = cur.fetchone()
+        cur.close()
+        return row is not None
+

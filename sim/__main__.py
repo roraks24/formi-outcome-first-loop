@@ -10,6 +10,8 @@ import shutil
 import sys
 import time
 from pathlib import Path
+import sys
+if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8')
 
 
 def main(argv=None):
@@ -59,7 +61,7 @@ def main(argv=None):
         g = grade(a.run, a.baseline)
         out = json.dumps(g, indent=2, default=dict) if a.json else to_markdown(g)
         if a.out:
-            Path(a.out).write_text(out)
+            Path(a.out).write_text(out, encoding="utf-8")
         print(out)
 
 

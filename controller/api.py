@@ -206,7 +206,7 @@ class SimClient:
             json_body=body,
             idempotency_key=pid,
         ).json()
-        if os.environ.get("TEST_CRASH_ON_SUBMIT") == "1":
+        if os.environ.get("ENABLE_TEST_CRASH_HOOKS") == "1" and os.environ.get("TEST_CRASH_ON_SUBMIT") == "1":
             os.environ["TEST_CRASH_ON_SUBMIT"] = "0"
             print("\n[TEST CRASH] Process killed immediately between submit and recording...", file=sys.stderr)
             import os as _os; _os._exit(42)
@@ -234,7 +234,7 @@ class SimClient:
             f"/workflows/{wid}/apply",
             json_body={"approval_id": approval_id},
         ).json()
-        if os.environ.get("TEST_CRASH_ON_APPLY") == "1":
+        if os.environ.get("ENABLE_TEST_CRASH_HOOKS") == "1" and os.environ.get("TEST_CRASH_ON_APPLY") == "1":
             os.environ["TEST_CRASH_ON_APPLY"] = "0"
             print("\n[TEST CRASH] Process killed immediately between apply and recording...", file=sys.stderr)
             import os as _os; _os._exit(43)

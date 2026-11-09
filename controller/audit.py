@@ -99,6 +99,12 @@ def explain_causal_chain(
                 print(f"   - Evidence: {det['evidence_json']}")
             else:
                 print(f"1. TRIGGER: Detection ID {det_id}")
+        elif dec_type == "SUPERVISOR_EDIT_INVALIDATION":
+            print("1. TRIGGER: Supervisor Edit Preemption")
+            print(f"   - Supervisor updated configuration mid-experiment at sim_minute {numbers.get('invalidated_minute', minute)}.")
+            print(f"   - Preempted Dimension: {inputs.get('dim')}")
+            print(f"   - Invalidation Reason: {inputs.get('reason')}")
+            print(f"   - Action: Terminated active experiment {inputs.get('experiment_id')} without overwriting supervisor changes.")
         else:
             print("1. TRIGGER: Routine Optimization / Scheduled Experiment")
 
@@ -113,17 +119,28 @@ def explain_causal_chain(
                 print(f"   - Dimension: {exp['dim']} | Control: {exp['control_arm']} | Arms: {exp['arms_json']}")
                 print(f"   - Sizing: n={exp['required_n_per_arm']} per arm (alpha={exp['alpha']}, power={exp['power']})")
 
-            cur.execute("SELECT * FROM analyses WHERE experiment_id = ? ORDER BY sim_minute DESC LIMIT 1;", (exp_id,))
-            ana = cur.fetchone()
-            if ana:
-                print("\n3. STATISTICAL EVALUATION:")
-                print(f"   - Winning Arm: {ana['arm']}")
-                print(f"   - Control Sample: {ana['k_control']}/{ana['n_control']} ({ana['k_control']/max(ana['n_control'],1):.3f})")
-                print(f"   - Treatment Sample: {ana['k_treatment']}/{ana['n_treatment']} ({ana['k_treatment']/max(ana['n_treatment'],1):.3f})")
-                print(f"   - Primary KPI p-value: {ana['p_value_primary']:.5f}")
-                print(f"   - Guardrail Non-inferiority: delta={ana['guardrail_delta']:+.4f} (p={ana['p_value_guardrail']:.4f})")
-                print(f"   - SRM Check p-value: {ana['srm_p_value']:.4f}")
-                print(f"   - Verdict: {ana['decision']}")
+            if dec_type == "EARLY_HARM_STOP":
+                print("\n3. EARLY HARM-STOP EVALUATION (INTERIM LOOK):")
+                print(f"   - Halted Arm: {inputs.get('halted_arm')} (restored {inputs.get('control_arm')})")
+                print(f"   - Interim Samples: Treatment n={numbers.get('interim_n_treatment')}, Control n={numbers.get('interim_n_control')}")
+                if numbers.get('diff_primary') is not None:
+                    print(f"   - Primary Metric Drop: {numbers.get('diff_primary'):+.4f} (p={numbers.get('p_harm_primary')})")
+                if numbers.get('guardrail_delta') is not None:
+                    print(f"   - Guardrail Delta: {numbers.get('guardrail_delta'):+.4f} (p={numbers.get('p_harm_guardrail')})")
+                print(f"   - Exploration Cost (Conversions Lost): Actual={numbers.get('exploration_cost_after')} vs Full Horizon Planned={numbers.get('exploration_cost_before')}")
+                print(f"   - Exploration Cost Avoided/Saved: {numbers.get('exploration_cost_saved')} units")
+            else:
+                cur.execute("SELECT * FROM analyses WHERE experiment_id = ? ORDER BY sim_minute DESC LIMIT 1;", (exp_id,))
+                ana = cur.fetchone()
+                if ana:
+                    print("\n3. STATISTICAL EVALUATION:")
+                    print(f"   - Winning Arm: {ana['arm']}")
+                    print(f"   - Control Sample: {ana['k_control']}/{ana['n_control']} ({ana['k_control']/max(ana['n_control'],1):.3f})")
+                    print(f"   - Treatment Sample: {ana['k_treatment']}/{ana['n_treatment']} ({ana['k_treatment']/max(ana['n_treatment'],1):.3f})")
+                    print(f"   - Primary KPI p-value: {ana['p_value_primary']:.5f}")
+                    print(f"   - Guardrail Non-inferiority: delta={ana['guardrail_delta']:+.4f} (p={ana['p_value_guardrail']:.4f})")
+                    print(f"   - SRM Check p-value: {ana['srm_p_value']:.4f}")
+                    print(f"   - Verdict: {ana['decision']}")
 
         # 3. Trace Governance Proposal
         prop_id = inputs.get("proposal_id")
@@ -160,17 +177,17 @@ def explain_causal_chain(
 
 def main():
     parser = argparse.ArgumentParser(description="Formi Audit & Causal Explanation CLI")
-    parser.add_argument("--db", default="runs/controller.db", help="Path to controller SQLite database")
+    parser.add_argument("--db", default=None, help="Path to controller SQLite database")
     subparsers = parser.add_subparsers(dest="cmd")
 
     why_p = subparsers.add_parser("why", help="Explain why a workflow changed at a specific time")
     why_p.add_argument("--workflow", required=True, help="Workflow identifier")
     why_p.add_argument("--at", required=False, help="Time specifier (e.g. 'D3 14:00' or ISO string)")
-    why_p.add_argument("--db", default=None, help="Path to controller SQLite database")
+    why_p.add_argument("--db", dest="why_db", default=None, help="Path to controller SQLite database")
 
     args = parser.parse_args()
 
-    db_path = getattr(args, "db", None) or "runs/controller.db"
+    db_path = getattr(args, "why_db", None) or getattr(args, "db", None) or "data/controller.db"
     store = Store(db_path)
     if args.cmd == "why":
         explain_causal_chain(store, workflow_id=args.workflow, at_str=args.at)

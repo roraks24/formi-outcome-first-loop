@@ -208,7 +208,7 @@ The controller conforms to `./run.sh <SIM_URL>`:
 ```
 Or directly via Python:
 ```bash
-python -m controller.main --url http://127.0.0.1:8700 --db runs/controller.db --tick 15
+python -m controller.main --url http://127.0.0.1:8700 --db data/controller.db --tick 15
 ```
 
 ### 11.3 Audit CLI: Answering "Why did workflow X change?"

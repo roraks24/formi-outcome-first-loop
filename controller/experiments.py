@@ -41,6 +41,7 @@ class Experiment:
     required_n_per_arm: int
     status: str
     created_minute: int
+    applied_minute: int | None = None
     concluded_minute: int | None = None
     winning_arm: str | None = None
 
@@ -61,14 +62,21 @@ class ExperimentManager:
     def restore_active_experiments(self) -> None:
         """Restores active experiments from SQLite on startup or post-crash."""
         cur = self.store._conn.cursor()
-        cur.execute("SELECT * FROM experiments WHERE status = 'RUNNING';")
+        cur.execute("SELECT * FROM experiments WHERE status IN ('RUNNING', 'PENDING_APPLY');")
         rows = cur.fetchall()
         cur.close()
         for r in rows:
             arms = json.loads(r["arms_json"])
-            # Equal weight allocation across active arms
-            w = 1.0 / len(arms)
-            weights = {a: w for a in arms}
+            wid = r["workflow_id"]
+            dim = r["dim"]
+            coh = r["cohort_id"]
+            try:
+                cur_cfg = self.governance.api.get_config(wid).get("config", {})
+                alloc = (cur_cfg.get("allocations", {}).get(coh) or {}).get(dim) or cur_cfg.get("allocations", {}).get("default", {}).get(dim, {})
+                weights = {a: float(alloc.get(a, 1.0 / len(arms))) for a in arms}
+            except Exception:
+                w = 1.0 / len(arms)
+                weights = {a: w for a in arms}
             exp = Experiment(
                 experiment_id=r["experiment_id"],
                 workflow_id=r["workflow_id"],
@@ -82,6 +90,7 @@ class ExperimentManager:
                 required_n_per_arm=r["required_n_per_arm"],
                 status=r["status"],
                 created_minute=r["created_minute"],
+                applied_minute=r["applied_minute"] if "applied_minute" in r.keys() else None,
             )
             self._active_experiments[r["workflow_id"]] = exp
 
@@ -98,14 +107,23 @@ class ExperimentManager:
     ) -> bool:
         """Designs a multi-arm experiment for a dimension and submits via governance."""
         wid = workflow_spec["workflow_id"]
+        # Block experiment launches if workflow has an open incident
+        if self.store.has_open_incident(wid):
+            return False
+
+        # Check cooldown: no relaunch on the same (workflow, dim) after NO_EFFECT/INVALIDATED/HALTED
+        if self.store.is_in_cooldown(wid, dim, sim_minute):
+            return False
+
+        # Concurrency cap: maximum 1 concurrent experiment per workflow
         if wid in self._active_experiments:
             return False
 
-        # SQLite check for existing running experiment or pending proposal
+        # SQLite check for existing active experiment or pending proposal
         cur = self.store._conn.cursor()
         cur.execute("SELECT COUNT(*) FROM proposals WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING');", (wid,))
         pending_props = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM experiments WHERE workflow_id = ? AND status = 'RUNNING';", (wid,))
+        cur.execute("SELECT COUNT(*) FROM experiments WHERE workflow_id = ? AND status IN ('RUNNING', 'PENDING_APPLY');", (wid,))
         running_exps = cur.fetchone()[0]
         cur.close()
         if pending_props > 0 or running_exps > 0:
@@ -123,8 +141,8 @@ class ExperimentManager:
         current_alloc = (cur_cfg.get("allocations", {}).get(cohort_id) or {}).get(dim) or cur_cfg.get("allocations", {}).get("default", {}).get(dim, {})
         control_arm = max(current_alloc.items(), key=lambda x: x[1])[0] if current_alloc else opts[0]
 
-        # Select 1 candidate treatment arm at a time to eliminate multiple negative variant drag
-        candidate_treatments = [o for o in opts if o != control_arm][:1]
+        # Select 1 candidate treatment arm at a time that has not been retired
+        candidate_treatments = [o for o in opts if o != control_arm and not self.store.is_candidate_retired(wid, dim, o)][:1]
         if not candidate_treatments:
             return False
 
@@ -182,13 +200,29 @@ class ExperimentManager:
         # Sizing feasibility check: if required n cannot be reached within max horizon
         # or if volume is so small that MDE exceeds 35% (statistically infeasible)
         if max_achievable_n < 100 or mde > 0.35:
+            infeas_id = make_deterministic_key(wid, f"exp_infeas_{dim}", {"mde": round(mde, 3)}, base_version)
+            with self.store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO experiments (
+                        experiment_id, workflow_id, cohort_id, dim, control_arm,
+                        arms_json, status, primary_kpi, guardrail_kpi,
+                        required_n_per_arm, alpha, power, mde, created_minute, concluded_minute
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'INFEASIBLE', ?, ?, ?, 0.05, 0.80, ?, ?, ?);
+                    """,
+                    (
+                        infeas_id, wid, cohort_id, dim, control_arm,
+                        json.dumps(all_arms), primary_kpi, guardrail_kpi,
+                        required_n, round(mde, 4), sim_minute, sim_minute,
+                    ),
+                )
             self.store.record_decision(
                 decision_id=make_deterministic_key(wid, f"dec_infeasible_{dim}", {"mde": round(mde, 3)}, base_version),
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=wid,
                 decision_type="EXPERIMENT_SKIPPED",
-                inputs_ref={"dimension": dim, "candidate": candidate_treatments[0]},
+                inputs_ref={"experiment_id": infeas_id, "dimension": dim, "candidate": candidate_treatments[0]},
                 numbers={
                     "baseline_rate": round(baseline_p, 4),
                     "daily_eval_units": round(daily_eval_units, 1),
@@ -219,12 +253,32 @@ class ExperimentManager:
         )
 
         dry_run = {
+            "experiment_id": exp_id,
             "dimension": dim,
             "arms": all_arms,
             "weights": alloc_weights,
             "required_n": required_n,
             "baseline_rate": round(baseline_p, 4),
+            "primary_kpi": primary_kpi,
+            "guardrail_kpi": guardrail_kpi,
         }
+
+        # Pre-record experiment in store as PENDING_APPLY so crash before submit returns is fully resilient
+        with self.store.transaction() as cur:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO experiments (
+                    experiment_id, workflow_id, cohort_id, dim, control_arm,
+                    arms_json, status, primary_kpi, guardrail_kpi,
+                    required_n_per_arm, alpha, power, mde, created_minute, applied_minute
+                ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING_APPLY', ?, ?, ?, 0.05, 0.80, ?, ?, NULL);
+                """,
+                (
+                    exp_id, wid, cohort_id, dim, control_arm,
+                    json.dumps(all_arms), primary_kpi, guardrail_kpi,
+                    required_n, round(mde, 4), sim_minute,
+                ),
+            )
 
         # Submit via governance
         prop_id = self.governance.submit_proposal(
@@ -241,23 +295,6 @@ class ExperimentManager:
         )
 
         if prop_id:
-            # Record experiment in store
-            with self.store.transaction() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO experiments (
-                        experiment_id, workflow_id, cohort_id, dim, control_arm,
-                        arms_json, status, primary_kpi, guardrail_kpi,
-                        required_n_per_arm, alpha, power, mde, created_minute
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, 0.05, 0.80, ?, ?);
-                    """,
-                    (
-                        exp_id, wid, cohort_id, dim, control_arm,
-                        json.dumps(all_arms), primary_kpi, guardrail_kpi,
-                        required_n, round(mde, 4), sim_minute,
-                    ),
-                )
-
             exp = Experiment(
                 experiment_id=exp_id,
                 workflow_id=wid,
@@ -269,13 +306,17 @@ class ExperimentManager:
                 primary_kpi=primary_kpi,
                 guardrail_kpi=guardrail_kpi,
                 required_n_per_arm=required_n,
-                status="RUNNING",
+                status="PENDING_APPLY",
                 created_minute=sim_minute,
+                applied_minute=None,
             )
             self._active_experiments[wid] = exp
             return True
-
-        return False
+        else:
+            # Proposal failed or was blocked; clean up pre-recorded experiment
+            with self.store.transaction() as cur:
+                cur.execute("DELETE FROM experiments WHERE experiment_id = ? AND status = 'PENDING_APPLY';", (exp_id,))
+            return False
 
     def evaluate_and_promote(
         self,
@@ -291,7 +332,9 @@ class ExperimentManager:
 
         dim_col = "welcome_message" if exp.dim == "welcome_message" else "voice"
 
-        # Query metrics per arm from events_agg during the experiment window
+        # Determine start hour from when the experiment was applied (exclude pre-apply traffic)
+        applied_minute = exp.applied_minute if exp.applied_minute is not None else exp.created_minute
+        exp_start_hour = (applied_minute // 60) + (1 if (applied_minute % 60) != 0 else 0)
         cur = self.store._conn.cursor()
         cur.execute(
             f"""
@@ -301,10 +344,10 @@ class ExperimentManager:
                 SUM(connected) AS connected,
                 SUM(engaged) AS engaged
             FROM events_agg
-            WHERE workflow_id = ?
+            WHERE workflow_id = ? AND (sim_day * 24 + sim_hour) >= ?
             GROUP BY {dim_col};
             """,
-            (wid,),
+            (wid, exp_start_hour),
         )
         rows = cur.fetchall()
         cur.close()
@@ -317,28 +360,191 @@ class ExperimentManager:
                 "engaged": int(r["engaged"] or 0),
             }
 
-        # Check if control and all treatment arms reached required sample size
-        ctrl = arm_stats.get(exp.control_arm, {"dials": 0, "connected": 0, "engaged": 0})
         eval_metric = "connected" if exp.primary_kpi == "engagement_rate" else "dials"
+        ctrl = arm_stats.get(exp.control_arm, {"dials": 0, "connected": 0, "engaged": 0})
         ctrl_n = ctrl[eval_metric]
+        treatment_arms = [a for a in exp.arms if a != exp.control_arm]
 
+        # Wait until candidate treatment arm has received at least some dials
+        if any(arm_stats.get(t, {}).get("dials", 0) == 0 for t in treatment_arms):
+            return False
+
+        # ----------------------------------------------------------------------
+        # Early Harm-Stop: Conservative one-sided interim looks (alpha spending)
+        # ----------------------------------------------------------------------
+        for t in treatment_arms:
+            t_stats = arm_stats.get(t, {"dials": 0, "connected": 0, "engaged": 0})
+            n_t_interim = t_stats[eval_metric]
+            # Check after accumulating minimal interim sample (n >= 60)
+            if n_t_interim >= 60:
+                if exp.primary_kpi == "engagement_rate":
+                    k_ctrl_i, n_ctrl_i = ctrl["engaged"], ctrl["connected"]
+                    k_t_i, n_t_i = t_stats["engaged"], t_stats["connected"]
+                    k_ctrl_g, n_ctrl_g = ctrl["connected"], ctrl["dials"]
+                    k_t_g, n_t_g = t_stats["connected"], t_stats["dials"]
+                else:
+                    k_ctrl_i, n_ctrl_i = ctrl["connected"], ctrl["dials"]
+                    k_t_i, n_t_i = t_stats["connected"], t_stats["dials"]
+                    k_ctrl_g, n_ctrl_g = ctrl["engaged"], ctrl["connected"]
+                    k_t_g, n_t_g = t_stats["engaged"], t_stats["connected"]
+
+                if n_ctrl_i > 0 and n_t_i > 0:
+                    # One-sided interim look with alpha spending (alpha_interim = 0.01)
+                    # 1. Inferiority on primary KPI (diff < -0.02 and p < 0.01)
+                    _, p_harm_primary, diff_primary, _ = two_proportion_z_test(
+                        k_ctrl_i, n_ctrl_i, k_t_i, n_t_i, alternative="less"
+                    )
+                    # 2. Guardrail breach (drop > max_drop and p < 0.01)
+                    obj = workflow_spec.get("objective", {})
+                    guardrail_spec = obj.get("guardrail", {})
+                    max_drop = float(guardrail_spec.get(f"{exp.guardrail_kpi}_max_drop", 0.02)) if isinstance(guardrail_spec, dict) else 0.02
+                    p_ctrl_g = (k_ctrl_g / n_ctrl_g) if n_ctrl_g > 0 else 0.0
+                    p_t_g = (k_t_g / n_t_g) if n_t_g > 0 else 0.0
+                    g_delta = p_t_g - p_ctrl_g
+                    is_guardrail_harm = False
+                    p_harm_g = 1.0
+                    if g_delta < -max_drop and n_ctrl_g > 0 and n_t_g > 0:
+                        _, p_harm_g, _, _ = two_proportion_z_test(
+                            k_ctrl_g, n_ctrl_g, k_t_g, n_t_g, alternative="less"
+                        )
+                        if p_harm_g < 0.01:
+                            is_guardrail_harm = True
+
+                    is_primary_harm = (p_harm_primary < 0.01 and diff_primary < -0.02)
+
+                    if is_primary_harm or is_guardrail_harm:
+                        # Early harm-stop triggered!
+                        rate_drop = abs(diff_primary) if is_primary_harm else abs(g_delta)
+                        exploration_cost_actual = round(n_t_interim * rate_drop, 2)
+                        exploration_cost_full = round(exp.required_n_per_arm * rate_drop, 2)
+                        exploration_cost_saved = round(exploration_cost_full - exploration_cost_actual, 2)
+
+                        self._close_experiment(exp, "HALTED", None, sim_minute)
+
+                        cur_cfg_resp = self.governance.api.get_config(wid)
+                        cur_cfg = cur_cfg_resp["config"]
+                        base_ver = cur_cfg_resp["version"]
+                        revert_cfg = copy.deepcopy(cur_cfg)
+                        revert_cfg.setdefault("allocations", {}).setdefault(exp.cohort_id, {})[exp.dim] = {exp.control_arm: 1.0}
+
+                        harm_desc = f"primary drop {diff_primary:+.3f} (p={p_harm_primary:.4f})" if is_primary_harm else f"guardrail drop {g_delta:+.3f} > max_drop {max_drop} (p={p_harm_g:.4f})"
+                        change_summary = f"Early harm-stop: halt {t} on {wid} ({exp.dim}), restore {exp.control_arm}"
+                        rationale = (
+                            f"Early harm-stop at interim look (n={n_t_interim}): arm {t} halted due to {harm_desc}. "
+                            f"Restoring 100% {exp.control_arm}. Exploration cost: actual={exploration_cost_actual} vs full={exploration_cost_full} (saved {exploration_cost_saved} units)."
+                        )
+                        dry_run = {
+                            "action": "early_harm_stop",
+                            "halted_arm": t,
+                            "control_arm": exp.control_arm,
+                            "interim_n": n_t_interim,
+                            "exploration_cost_before": exploration_cost_full,
+                            "exploration_cost_after": exploration_cost_actual,
+                            "exploration_cost_saved": exploration_cost_saved,
+                        }
+                        self.governance.submit_proposal(
+                            workflow_spec=workflow_spec,
+                            base_version=base_ver,
+                            proposed_config=revert_cfg,
+                            change_summary=change_summary,
+                            rationale=rationale,
+                            affected_leads=workflow_spec.get("daily_batch", {}).get("size", 1000),
+                            impact_score=0.70,
+                            dry_run=dry_run,
+                            sim_minute=sim_minute,
+                            sim_ts=sim_ts,
+                            is_incident=True,
+                            experiment_id=exp.experiment_id,
+                        )
+
+                        self.store.record_decision(
+                            decision_id=make_deterministic_key(wid, f"dec_harm_stop_{t}", {"interim_n": n_t_interim}, sim_minute),
+                            sim_minute=sim_minute,
+                            ts=sim_ts,
+                            workflow_id=wid,
+                            decision_type="EARLY_HARM_STOP",
+                            inputs_ref={"experiment_id": exp.experiment_id, "halted_arm": t, "control_arm": exp.control_arm},
+                            numbers={
+                                "interim_n_treatment": n_t_interim,
+                                "interim_n_control": ctrl_n,
+                                "diff_primary": diff_primary,
+                                "p_harm_primary": p_harm_primary,
+                                "guardrail_delta": g_delta,
+                                "p_harm_guardrail": p_harm_g,
+                                "exploration_cost_before": exploration_cost_full,
+                                "exploration_cost_after": exploration_cost_actual,
+                                "exploration_cost_saved": exploration_cost_saved,
+                            },
+                            policy_clause="statistical_integrity.early_harm_stop",
+                            outcome=f"halted_{t}_restored_{exp.control_arm}",
+                        )
+                        return False
+
+        # Check timeout (experiment ran > 4 days without reaching required sample size)
+        if sim_minute - exp.created_minute > (4 * 1440):
+            self._close_experiment(exp, "TIMED_OUT", None, sim_minute)
+            cur_cfg_resp = self.governance.api.get_config(wid)
+            cur_cfg = cur_cfg_resp["config"]
+            base_ver = cur_cfg_resp["version"]
+            revert_cfg = copy.deepcopy(cur_cfg)
+            revert_cfg.setdefault("allocations", {}).setdefault(exp.cohort_id, {})[exp.dim] = {exp.control_arm: 1.0}
+            self.governance.submit_proposal(
+                workflow_spec=workflow_spec,
+                base_version=base_ver,
+                proposed_config=revert_cfg,
+                change_summary=f"Timeout: restore control {exp.control_arm} on {wid} ({exp.dim})",
+                rationale=f"Experiment {exp.experiment_id} timed out before reaching planned sample size. Restoring control arm {exp.control_arm}.",
+                affected_leads=workflow_spec.get("daily_batch", {}).get("size", 1000),
+                impact_score=0.35,
+                dry_run={"action": "timeout_revert", "control_arm": exp.control_arm},
+                sim_minute=sim_minute,
+                sim_ts=sim_ts,
+                is_incident=True,
+                experiment_id=exp.experiment_id,
+            )
+            return False
+
+        # Check if control and all treatment arms reached required sample size
         if ctrl_n < exp.required_n_per_arm:
             return False
 
-        treatment_arms = [a for a in exp.arms if a != exp.control_arm]
         for t in treatment_arms:
             t_n = arm_stats.get(t, {}).get(eval_metric, 0)
             if t_n < exp.required_n_per_arm:
                 return False
 
         # 1. Sample Ratio Mismatch (SRM) check
+        # Only run Pearson chi-square SRM check on workflows where mid_flight allows immediate cutover;
+        # on next_campaign_only workflows, older in-flight campaigns dial control, creating a heterogeneous mixture.
         observed_counts = [arm_stats.get(a, {}).get("dials", 0) for a in exp.arms]
         expected_weights = [exp.weights.get(a, 0.25) for a in exp.arms]
-        srm_p_val, is_srm = check_sample_ratio_mismatch(observed_counts, expected_weights)
+        is_srm = False
+        srm_p_val = 1.0
+        if workflow_spec.get("mid_flight") != "next_campaign_only" and min(observed_counts) >= 100:
+            srm_p_val, is_srm = check_sample_ratio_mismatch(observed_counts, expected_weights)
 
         if is_srm:
-            # Abort experiment due to allocation imbalance
+            # Abort experiment due to allocation imbalance and restore control
             self._close_experiment(exp, "INVALIDATED", None, sim_minute)
+            cur_cfg_resp = self.governance.api.get_config(wid)
+            cur_cfg = cur_cfg_resp["config"]
+            base_ver = cur_cfg_resp["version"]
+            revert_cfg = copy.deepcopy(cur_cfg)
+            revert_cfg.setdefault("allocations", {}).setdefault(exp.cohort_id, {})[exp.dim] = {exp.control_arm: 1.0}
+            self.governance.submit_proposal(
+                workflow_spec=workflow_spec,
+                base_version=base_ver,
+                proposed_config=revert_cfg,
+                change_summary=f"SRM abort: restore control {exp.control_arm} on {wid} ({exp.dim})",
+                rationale=f"SRM detected (p={srm_p_val:.4f}). Restoring 100% control arm {exp.control_arm}.",
+                affected_leads=workflow_spec.get("daily_batch", {}).get("size", 1000),
+                impact_score=0.50,
+                dry_run={"action": "srm_revert", "control_arm": exp.control_arm},
+                sim_minute=sim_minute,
+                sim_ts=sim_ts,
+                is_incident=True,
+                experiment_id=exp.experiment_id,
+            )
             self.store.record_decision(
                 decision_id=make_deterministic_key(wid, "dec_srm", {"exp_id": exp.experiment_id}, sim_minute),
                 sim_minute=sim_minute,
@@ -370,7 +576,7 @@ class ExperimentManager:
 
         obj = workflow_spec.get("objective", {})
         guardrail_spec = obj.get("guardrail", {})
-        max_drop = float(guardrail_spec.get(f"{exp.guardrail_kpi}_max_drop", 0.02))
+        max_drop = float(guardrail_spec.get(f"{exp.guardrail_kpi}_max_drop", 0.02)) if isinstance(guardrail_spec, dict) else 0.02
 
         for t in treatment_arms:
             t_stats = arm_stats[t]
@@ -446,12 +652,36 @@ class ExperimentManager:
 
         if winner_arm:
             # Propose winner promotion via governance
-            self._close_experiment(exp, "CONCLUDED", winner_arm, sim_minute)
-            self._promote_winner(workflow_spec, exp, winner_arm, best_lift, sim_minute, sim_ts)
-            return True
+            promoted = self._promote_winner(workflow_spec, exp, winner_arm, best_lift, sim_minute, sim_ts)
+            if promoted:
+                self._close_experiment(exp, "WINNER", winner_arm, sim_minute)
+                return True
+            return False
         else:
-            # Inconclusive or no arm beat control
-            self._close_experiment(exp, "CONCLUDED", None, sim_minute)
+            # Inconclusive, guardrail vetoed, or no arm beat control: restore 100% control arm
+            self._close_experiment(exp, "NO_EFFECT", None, sim_minute)
+            cur_cfg_resp = self.governance.api.get_config(wid)
+            cur_cfg = cur_cfg_resp["config"]
+            base_ver = cur_cfg_resp["version"]
+            revert_cfg = copy.deepcopy(cur_cfg)
+            revert_cfg.setdefault("allocations", {}).setdefault(exp.cohort_id, {})[exp.dim] = {exp.control_arm: 1.0}
+            change_summary = f"Restore control {exp.control_arm} on {wid} ({exp.dim}): no arm beat control"
+            rationale = f"Experiment {exp.experiment_id} concluded without a winning variant. Restoring 100% control arm {exp.control_arm}."
+            dry_run = {"action": "revert_control", "control_arm": exp.control_arm}
+            self.governance.submit_proposal(
+                workflow_spec=workflow_spec,
+                base_version=base_ver,
+                proposed_config=revert_cfg,
+                change_summary=change_summary,
+                rationale=rationale,
+                affected_leads=workflow_spec.get("daily_batch", {}).get("size", 1000),
+                impact_score=0.40,
+                dry_run=dry_run,
+                sim_minute=sim_minute,
+                sim_ts=sim_ts,
+                is_incident=True,
+                experiment_id=exp.experiment_id,
+            )
             return False
 
     def _promote_winner(
@@ -462,7 +692,7 @@ class ExperimentManager:
         lift: float,
         sim_minute: int,
         sim_ts: str,
-    ) -> None:
+    ) -> bool:
         """Promotes winning arm while maintaining a 20% holdout control arm for decay monitoring."""
         wid = workflow_spec["workflow_id"]
         cur_cfg_resp = self.governance.api.get_config(wid)
@@ -494,6 +724,7 @@ class ExperimentManager:
             dry_run=dry_run,
             sim_minute=sim_minute,
             sim_ts=sim_ts,
+            experiment_id=exp.experiment_id,
         )
 
         if prop_id:
@@ -517,6 +748,8 @@ class ExperimentManager:
                 policy_clause="experiments.promotion",
                 outcome=f"promoted_{winner}_with_holdout",
             )
+            return True
+        return False
 
     def check_decay_and_rollback(
         self,
@@ -653,8 +886,73 @@ class ExperimentManager:
             )
         self._active_experiments.pop(exp.workflow_id, None)
 
-    def invalidate_for_workflow(self, workflow_id: str, reason: str, sim_minute: int) -> None:
+        # Candidate retirement: permanently retire inferior/no-effect candidates
+        if status in ("NO_EFFECT", "TIMED_OUT"):
+            for t in [a for a in exp.arms if a != exp.control_arm]:
+                self.store.retire_candidate(exp.workflow_id, exp.dim, t, sim_minute, status)
+
+        # Post-experiment cooldown: prevent relaunch on same (workflow, dim) after NO_EFFECT/INVALIDATED/HALTED/TIMED_OUT
+        if status in ("NO_EFFECT", "HALTED", "INVALIDATED", "TIMED_OUT"):
+            cooldown_days = 3
+            cooldown_min = sim_minute + (cooldown_days * 1440)
+            self.store.set_cooldown(exp.workflow_id, exp.dim, cooldown_min, status)
+
+    def notify_config_applied(self, workflow_id: str, version: int, minute: int) -> None:
+        """Transitions pending experiment to RUNNING when controller's own config apply is confirmed."""
+        exp = self._active_experiments.get(workflow_id)
+        if exp and exp.status == "PENDING_APPLY":
+            exp.status = "RUNNING"
+            exp.applied_minute = minute
+            with self.store.transaction() as cur:
+                cur.execute(
+                    """
+                    UPDATE experiments
+                    SET status = 'RUNNING', applied_minute = ?
+                    WHERE experiment_id = ?;
+                    """,
+                    (minute, exp.experiment_id),
+                )
+
+    def invalidate_for_workflow(
+        self,
+        workflow_id: str,
+        reason: str,
+        sim_minute: int,
+        sim_ts: str = "",
+    ) -> None:
         """Invalidates running experiment if a supervisor edit modified underlying configuration."""
         exp = self._active_experiments.pop(workflow_id, None)
         if exp:
             self._close_experiment(exp, "INVALIDATED", None, sim_minute)
+            self.store.record_decision(
+                decision_id=make_deterministic_key(workflow_id, "dec_inv", {"reason": reason}, sim_minute),
+                sim_minute=sim_minute,
+                ts=sim_ts or f"minute_{sim_minute}",
+                workflow_id=workflow_id,
+                decision_type="SUPERVISOR_EDIT_INVALIDATION",
+                inputs_ref={"experiment_id": exp.experiment_id, "dim": exp.dim, "reason": reason},
+                numbers={"created_minute": exp.created_minute, "invalidated_minute": sim_minute},
+                policy_clause="governance.supervisor_preemption",
+                outcome=f"experiment_{exp.experiment_id}_invalidated_by_{reason}",
+            )
+
+    def get_experiment_outcome_counts(self) -> dict[str, int]:
+        """Tally of experiment outcomes: winner, no-effect, infeasible, timed-out, invalidated, halted."""
+        counts = {
+            "winner": 0,
+            "no-effect": 0,
+            "infeasible": 0,
+            "timed-out": 0,
+            "invalidated": 0,
+            "halted": 0,
+        }
+        cur = self.store._conn.cursor()
+        cur.execute("SELECT status, COUNT(*) AS cnt FROM experiments GROUP BY status;")
+        for r in cur.fetchall():
+            s = str(r["status"]).lower().replace("_", "-")
+            if s in counts:
+                counts[s] = int(r["cnt"])
+            elif s == "concluded":
+                counts["winner"] += int(r["cnt"])
+        cur.close()
+        return counts

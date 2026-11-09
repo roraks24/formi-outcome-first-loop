@@ -181,7 +181,7 @@ class IngestPipeline:
             prune_day_before=prune_day,
         )
 
-        if os.environ.get("TEST_CRASH_ON_INGEST") == "1":
+        if os.environ.get("ENABLE_TEST_CRASH_HOOKS") == "1" and os.environ.get("TEST_CRASH_ON_INGEST") == "1":
             os.environ["TEST_CRASH_ON_INGEST"] = "0"
             print("\n[TEST CRASH] Process killed mid-ingest after committing chunk...", file=sys.stderr)
             import os as _os; _os._exit(41)

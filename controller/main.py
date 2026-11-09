@@ -68,7 +68,7 @@ class Controller:
     def __init__(
         self,
         sim_url: str = "http://127.0.0.1:8700",
-        db_path: str = "runs/controller.db",
+        db_path: str = "data/controller.db",
         tick_minutes: int = 15,
     ):
         self.sim_url = sim_url
@@ -92,6 +92,8 @@ class Controller:
         self.tick_durations: list[float] = []
         self.workflow_specs: dict[str, dict[str, Any]] = {}
         self.supervisor_edited_dims: dict[str, set[str]] = {}
+        self.current_sim_minute = 0
+        self.current_sim_ts = ""
         self._setup_signals()
 
     def _setup_signals(self) -> None:
@@ -106,16 +108,20 @@ class Controller:
         wid = ev.get("workflow_id", "")
         ver = int(ev.get("version", 1))
         actor = ev.get("actor", "")
-        minute = 0
+        minute = self.current_sim_minute
+        ts = self.current_sim_ts
         cfg = self.api.get_config(wid).get("config", {})
         self.store.save_config_snapshot(wid, ver, actor, minute, cfg)
 
-        # Invalidate active experiments if supervisor altered configuration
-        if actor == "supervisor":
+        # Invalidate active experiments only if external non-controller actor altered configuration
+        if not actor.startswith("controller_"):
             changed_dims = ev.get("changed_dims", [])
             self.supervisor_edited_dims.setdefault(wid, set()).update(changed_dims)
-            print(f"[SUPERVISOR] Detected supervisor edit on {wid} (v{ver}, dims={changed_dims}). Invalidating experiments.", file=sys.stderr)
-            self.experiments.invalidate_for_workflow(wid, "supervisor_edit", minute)
+            print(f"[SUPERVISOR] Detected external/supervisor edit on {wid} (v{ver}, actor={actor}, dims={changed_dims}). Invalidating experiments.", file=sys.stderr)
+            self.experiments.invalidate_for_workflow(wid, f"external_edit_{actor}", minute, ts)
+        else:
+            # Controller's own apply: notify experiment manager of apply confirmation
+            self.experiments.notify_config_applied(wid, ver, minute)
 
     def _handle_approval_decided(self, ev: dict[str, Any]) -> None:
         aid = ev.get("approval_id", "")
@@ -190,6 +196,30 @@ class Controller:
                                     state["sim_minute"], state["sim_minute"] + int(ttl_hours * 60),
                                 ),
                             )
+                        if dry_run and "dimension" in dry_run:
+                            dim = dry_run["dimension"]
+                            arms = dry_run.get("arms", [])
+                            req_n = dry_run.get("required_n", 100)
+                            exp_id = dry_run.get("experiment_id") or make_deterministic_key(wid, f"exp_{dim}", diff, base_ver)
+                            w_spec = self.workflow_specs.get(wid, {})
+                            p_kpi = dry_run.get("primary_kpi") or (w_spec.get("objective", {}).get("primary") if isinstance(w_spec.get("objective", {}).get("primary"), str) else "conclusion_rate")
+                            g_kpi = dry_run.get("guardrail_kpi") or ("pickup_rate" if p_kpi == "engagement_rate" else "engagement_rate")
+                            ctrl_arm = arms[0] if arms else "control"
+                            with self.store.transaction() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT OR IGNORE INTO experiments (
+                                        experiment_id, workflow_id, cohort_id, dim, control_arm,
+                                        arms_json, status, primary_kpi, guardrail_kpi,
+                                        required_n_per_arm, alpha, power, mde, created_minute, applied_minute
+                                    ) VALUES (?, ?, 'default', ?, ?, ?, 'PENDING_APPLY', ?, ?, ?, 0.05, 0.80, 0.08, ?, NULL);
+                                    """,
+                                    (
+                                        exp_id, wid, dim, ctrl_arm,
+                                        json.dumps(arms), p_kpi, g_kpi,
+                                        req_n, state["sim_minute"],
+                                    ),
+                                )
                     else:
                         self.store.mark_intent_failed(key, state["ts"], "not_found_on_sim")
                 elif action == "apply_approval":
@@ -237,6 +267,8 @@ class Controller:
 
             sim_ts = adv["ts"]
             sim_min = adv["sim_minute"]
+            self.current_sim_minute = sim_min
+            self.current_sim_ts = sim_ts
             sim_day = sim_min // 1440
             current_hour = (sim_min % 1440) // 60
             finished = adv.get("finished", False)
@@ -249,7 +281,9 @@ class Controller:
             events_per_sec = tick_events / dt_s
 
             # 2. Reconcile approved proposals and apply them
-            self.governance.reconcile_and_apply_approved(sim_minute=sim_min, sim_ts=sim_ts)
+            applied_cnt = self.governance.reconcile_and_apply_approved(sim_minute=sim_min, sim_ts=sim_ts)
+            if applied_cnt > 0:
+                self.experiments.restore_active_experiments()
 
             # 3. Anomaly detection & Incident Response
             for wid, spec in self.workflow_specs.items():
@@ -338,7 +372,7 @@ class Controller:
 def main():
     parser = argparse.ArgumentParser(description="Formi Outcome-First Agent Loop Controller")
     parser.add_argument("--url", "--sim-url", dest="url", default="http://127.0.0.1:8700", help="Simulator server URL")
-    parser.add_argument("--db", default="runs/controller.db", help="Path to SQLite WAL database")
+    parser.add_argument("--db", default="data/controller.db", help="Path to SQLite WAL database")
     parser.add_argument("--tick", "--ticks", dest="tick", type=int, default=15, help="Sim minutes to advance per tick")
     args = parser.parse_args()
 

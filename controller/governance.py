@@ -5,7 +5,7 @@ State Machine:
 
 Enforces:
   1. Write-ahead intents before calling API endpoints (crash-safety & idempotency).
-  2. Approver fatigue protection (throttles to <= 2 requests / 24h per workflow).
+  2. Approver fatigue protection (throttles to <= max_requests_per_24h, reserving the last slot for incidents).
   3. Working hours synchronization (submits between 11:00 and 17:00 IST to respect standups).
   4. Stale-base detection & safe re-proposal.
   5. Policy-permitted auto-apply with total-variation shift checking.
@@ -74,6 +74,12 @@ def compute_config_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dic
             "old": old_cfg.get("prompt_version"),
             "new": new_cfg.get("prompt_version"),
         }
+
+    for k in set(old_cfg.keys()) | set(new_cfg.keys()):
+        if k in ("allocations", "schedule", "prompt_version"):
+            continue
+        if old_cfg.get(k) != new_cfg.get(k):
+            diff[k] = {"old": old_cfg.get(k), "new": new_cfg.get(k)}
 
     for cohort_key in set(old_cfg.get("allocations", {})) | set(new_cfg.get("allocations", {})):
         old_alloc = old_cfg.get("allocations", {}).get(cohort_key, {})
@@ -182,8 +188,13 @@ class GovernanceEngine:
         self,
         workflow_spec: dict[str, Any],
         sim_minute: int,
+        is_incident: bool = False,
     ) -> bool:
-        """Throttles requests to max_requests_per_24h defined in workflow governance policy."""
+        """Throttles requests to max_requests_per_24h defined in workflow governance policy.
+
+        Reserves approver capacity for incidents: experiments cannot take the last slot in
+        the 24h window. Incident proposals jump the queue and can use all remaining slots.
+        """
         wid = workflow_spec["workflow_id"]
         gov = workflow_spec.get("governance", {})
         max_requests = int(gov.get("max_requests_per_24h", 3))
@@ -198,7 +209,10 @@ class GovernanceEngine:
         row = cur.fetchone()
         cur.close()
         count = int(row["cnt"] or 0)
-        return count >= max_requests
+        if is_incident:
+            return count >= max_requests
+        else:
+            return count >= max(1, max_requests - 1)
 
     def submit_proposal(
         self,
@@ -213,6 +227,9 @@ class GovernanceEngine:
         sim_minute: int,
         sim_ts: str,
         evidence: dict[str, Any] | None = None,
+        is_incident: bool = False,
+        detection_id: str | None = None,
+        experiment_id: str | None = None,
     ) -> str | None:
         """Executes proposal submission via either auto-apply or /approvals with full crash safety."""
         wid = workflow_spec["workflow_id"]
@@ -222,6 +239,28 @@ class GovernanceEngine:
         if not diff:
             # No changes to propose or apply
             return None
+
+        is_incident = (
+            is_incident
+            or (impact_score >= 0.70)
+            or ("rotate" in change_summary.lower())
+            or ("remediate" in change_summary.lower())
+            or ("caller id" in change_summary.lower())
+            or ("rollback" in change_summary.lower())
+        )
+
+        if is_incident:
+            # Withdraw/supersede any pending non-incident experiment proposals for this workflow
+            with self.store.transaction() as cur:
+                cur.execute(
+                    """
+                    UPDATE proposals 
+                    SET status = 'WITHDRAWN' 
+                    WHERE workflow_id = ? AND status IN ('SUBMITTED', 'PENDING')
+                      AND impact_score < 0.70;
+                    """,
+                    (wid,),
+                )
 
         # 1. Determine if proposal can be auto-applied
         can_auto, auto_reason = self.can_auto_apply(workflow_spec, old_cfg, proposed_config)
@@ -280,13 +319,19 @@ class GovernanceEngine:
                         ),
                     )
 
+                inputs_ref_auto: dict[str, Any] = {"proposal_id": auto_prop_id}
+                if detection_id:
+                    inputs_ref_auto["detection_id"] = detection_id
+                if experiment_id:
+                    inputs_ref_auto["experiment_id"] = experiment_id
+
                 self.store.record_decision(
-                    decision_id=make_deterministic_key(wid, "dec_auto", proposed_config, base_version),
+                    decision_id=f"dec_{auto_prop_id}",
                     sim_minute=sim_minute,
                     ts=sim_ts,
                     workflow_id=wid,
                     decision_type="AUTO_APPLY",
-                    inputs_ref={"proposal_id": auto_prop_id},
+                    inputs_ref=inputs_ref_auto,
                     numbers={"impact_score": impact_score, "affected_leads": affected_leads},
                     policy_clause=f"auto_apply_permitted:{auto_reason}",
                     outcome=f"auto_applied_v{new_ver}",
@@ -311,15 +356,16 @@ class GovernanceEngine:
             # Defer submission until approver is online
             return None
 
-        is_incident = impact_score >= 0.70
-        if not is_incident and self.is_approver_fatigued(workflow_spec, sim_minute):
-            # Throttle to avoid fatigue rejection
+        if self.is_approver_fatigued(workflow_spec, sim_minute, is_incident=is_incident):
+            # Throttle to avoid fatigue rejection; experiments reserve final slot for incidents
             return None
 
         ttl_hours = min(float(gov.get("proposal_ttl_hours", 24)), 24.0)
-        appr_proposal_id = make_deterministic_key(wid, "prop", proposed_config, base_version)
+        base_proposal_key = make_deterministic_key(wid, "prop", proposed_config, base_version)
+        current_attempt = self.store.get_or_create_proposal_attempt(base_proposal_key, sim_ts)
+        appr_proposal_id = f"{base_proposal_key}_att{current_attempt}"
 
-        # Idempotency check: if this exact proposal was already recorded locally
+        # Idempotency check: if this attempt was already recorded locally
         cur = self.store._conn.cursor()
         cur.execute("SELECT status FROM proposals WHERE proposal_id = ?;", (appr_proposal_id,))
         p_row = cur.fetchone()
@@ -327,8 +373,22 @@ class GovernanceEngine:
         i_row = cur.fetchone()
         cur.close()
         if p_row or i_row:
-            # If already pending, return proposal_id; if decided/rejected, suppress duplicate submission
-            return appr_proposal_id if (p_row and p_row["status"] in ("SUBMITTED", "PENDING")) else None
+            status = p_row["status"].lower() if p_row else (i_row["status"].lower() if i_row else "")
+            if status in ("submitted", "pending", "approved", "applied"):
+                return appr_proposal_id
+            elif status == "rejected" and is_incident:
+                # Prior incident proposal rejected on judgement call, but incident remains unmitigated.
+                # Advance persisted attempt counter (independent of sim_minute).
+                current_attempt = self.store.increment_proposal_attempt(base_proposal_key, sim_ts)
+                appr_proposal_id = f"{base_proposal_key}_att{current_attempt}"
+                cur2 = self.store._conn.cursor()
+                cur2.execute("SELECT status FROM proposals WHERE proposal_id = ?;", (appr_proposal_id,))
+                r_row = cur2.fetchone()
+                cur2.close()
+                if r_row:
+                    return appr_proposal_id if r_row["status"].lower() in ("submitted", "pending") else None
+            else:
+                return None
 
         body = {
             "proposal_id": appr_proposal_id,
@@ -379,13 +439,19 @@ class GovernanceEngine:
                     ),
                 )
 
+            inputs_ref_submit: dict[str, Any] = {"proposal_id": appr_proposal_id, "approval_id": aid}
+            if detection_id:
+                inputs_ref_submit["detection_id"] = detection_id
+            if experiment_id:
+                inputs_ref_submit["experiment_id"] = experiment_id
+
             self.store.record_decision(
-                decision_id=make_deterministic_key(wid, "dec_submit", proposed_config, base_version),
+                decision_id=f"dec_{appr_proposal_id}",
                 sim_minute=sim_minute,
                 ts=sim_ts,
                 workflow_id=wid,
                 decision_type="PROPOSAL_SUBMITTED",
-                inputs_ref={"proposal_id": appr_proposal_id, "approval_id": aid},
+                inputs_ref=inputs_ref_submit,
                 numbers={"impact_score": impact_score, "affected_leads": affected_leads},
                 policy_clause="governance.approvals",
                 outcome=f"submitted_approval_{aid}",
@@ -449,7 +515,7 @@ class GovernanceEngine:
                 cur.execute("SELECT status FROM proposals WHERE approval_id = ?;", (aid,))
                 row = cur.fetchone()
                 cur.close()
-                if row and row["status"] in ("STALE", "APPLIED", "LAPSED", "EXPIRED"):
+                if row and row["status"] in ("STALE", "APPLIED", "LAPSED", "EXPIRED", "WITHDRAWN"):
                     continue
 
                 # Live config shifted (e.g. supervisor edit); mark proposal STALE
@@ -499,6 +565,14 @@ class GovernanceEngine:
                         WHERE approval_id = ?;
                         """,
                         (sim_minute, new_ver, aid),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE experiments
+                        SET created_minute = ?
+                        WHERE workflow_id = ? AND status = 'RUNNING';
+                        """,
+                        (sim_minute, wid),
                     )
 
                 self.store.record_decision(
