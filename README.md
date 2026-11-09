@@ -185,7 +185,7 @@ thing you cut.
 ### 11.1 Quickstart & Reproduction Commands
 
 ```bash
-# 1. Run all unit and integration tests (25 tests covering stats, ingest, idempotency, recovery)
+# 1. Run all unit and integration tests (31 tests covering stats, ingest, idempotency, recovery)
 python -m pytest
 
 # 2. Run public_01_dev end-to-end
@@ -197,7 +197,7 @@ python scripts/run_public_02.py
 # 4. Run public_03_load benchmark (tests ingestion and memory throughput at 650k dials/day)
 python scripts/run_public_03.py
 
-# 5. Run the crash-recovery demonstration (simulates kill -9 and seamless recovery)
+# 5. Run the crash-recovery demonstration (tests kill -9 recovery across 4 critical failure points)
 python scripts/crash_demo.py # or ./scripts/crash_demo.sh
 ```
 
@@ -221,7 +221,7 @@ This produces an end-to-end trace detailing:
 2. **Detection Evidence**: Baseline vs. observed rates, p-values, sample sizes.
 3. **Hypothesis & Candidate Selection**: Options considered, synthetic validation run IDs.
 4. **Governance & Approval**: Proposal ID, base version vs. applied version, human vs. auto-apply.
-5. **Applied Version Status**: Resulting live configuration snapshot.
+5. **Workflow Configuration Status**: Displays latest workflow configuration snapshots (note: queries current latest snapshots for the workflow, rather than point-in-time historical reconstruction).
 
 ### 11.4 On-Call Runbook & Core Production Alerts
 
@@ -259,8 +259,14 @@ This produces an end-to-end trace detailing:
 - `controller/cohort.py`: Feature-based cohort matching with hierarchical fallback.
 - `controller/stats.py`: Pure mathematical statistics: power sizing, two-proportion z-tests, Holm-Bonferroni correction, SRM detection.
 - `controller/detect.py`: Anomaly and drift detectors (caller ID degradation, hallucination spikes).
-- `controller/experiments.py`: Lead-level randomized A/B experimentation, winner promotion, holdout tracking, decay rollback.
+- `controller/experiments.py`: Lead-level randomized A/B experimentation with dynamic MDE power sizing, sequential interim harm-stops (fixed critical values at p < 0.01), candidate retirement, and synthetic decay rollback test harness (note: small lifts remained inconclusive on live benchmark data and zero variants reached 100% exploit traffic; decay rollback was verified strictly via synthetic unit and integration tests).
 - `controller/governance.py`: Proposal state machine, approver timing/fatigue protection, auto-apply validation, stale-base detection.
 - `controller/incidents.py`: Automated remediation playbooks for caller ID rotation and prompt fixes.
 - `controller/audit.py`: Human-readable CLI query tool for causal decision audits.
 - `controller/main.py`: Orchestrator loop with startup `recover()`, per-tick advance, and structured telemetry logging.
+
+### 11.6 Empirical Benchmark Outcomes & Scope Highlights
+- **Routine Optimization vs Noise**: At low call volume (~300 dials/hour), dynamic MDE sits at 25%–35%; routine 1%–3% variant lifts remain inconclusive (`public_01`: $\Delta -0.5\%$, `public_03`: $\Delta +0.2\%$ across 4.2M events at 35,193 events/s, zero lag, 124 MB peak RSS, 37 neutral applies, 7 running, 2 harm-stopped).
+- **Incident Remediation Value**: Controller value is overwhelmingly concentrated in automated incident response: on `ks_cancel` (`public_02`), caller-ID rotation and prompt remediation eliminated degraded DID traffic (0.0% by Day 3) and cut hallucinations by 71% (348 to 100), boosting conclusion rate by +49.1% and pickup by +33.5%; on `apex_collections` (`gen_v2`), caller-ID rotation produced +54.8% conclusion lift.
+- **Resolution Timelines**: 180–450 minutes on `public_02`, while `gen_v2` took ~32 hours due to 5.5h detection persistence, an in-flight experiment bumping base version (stale base conflict), approver night closure (18:00–10:00), and simulator 24-hour fatigue caps (`max_requests_per_24h = 3`).
+- **Known Limitations**: Fully documented in `SUBMISSION.md` §13 (guardrail point-estimate sensitivity, placeholder guardrail p-values, identical retry payloads, 3-day hardcoded cooldown, and uncontainerized Python 3.11 venv runtime).

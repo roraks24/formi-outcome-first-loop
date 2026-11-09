@@ -1,23 +1,23 @@
 # Simulator HTTP API & Protocol Contract
 
-This document records the exact interface and behavioral contract exposed by the simulator to any controller, citing the simulator documentation ([docs/SIMULATOR.md](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md)), scenario specifications, and ground rules ([README.md](file:///E:/Coding/diwali%20day%20hustle/README.md)).
+This document records the exact interface and behavioral contract exposed by the simulator to any controller, citing the simulator documentation ([docs/SIMULATOR.md](SIMULATOR.md)), scenario specifications, and ground rules ([README.md](\.\./README.md)).
 
 ---
 
 ## 1. HTTP Endpoints
 
-All communication between the controller and the simulator occurs over HTTP ([docs/SIMULATOR.md §0, §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L4-L6)).
+All communication between the controller and the simulator occurs over HTTP ([docs/SIMULATOR.md §0, §7](SIMULATOR.md#L4-L6)).
 No authentication headers are required. All JSON payloads are standard `application/json` unless noted.
 
 ### 1.1 `GET /health`
-- **Citation**: [docs/SIMULATOR.md §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L181-L184)
+- **Citation**: [docs/SIMULATOR.md §7](SIMULATOR.md#L181-L184)
 - **Request**: None.
 - **Response**: `200 OK` `{"ok": true}`.
 - **Credit Cost**: 0.
 - **Errors**: Standard network/server unreachable.
 
 ### 1.2 `GET /sim/state`
-- **Citation**: [docs/SIMULATOR.md §1, §5, §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L147-L150)
+- **Citation**: [docs/SIMULATOR.md §1, §5, §7](SIMULATOR.md#L147-L150)
 - **Request**: None.
 - **Response**: `200 OK`
   ```json
@@ -36,7 +36,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 - **Credit Cost**: 0.
 
 ### 1.3 `POST /sim/advance`
-- **Citation**: [docs/SIMULATOR.md §1, §6](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L21-L28)
+- **Citation**: [docs/SIMULATOR.md §1, §6](SIMULATOR.md#L21-L28)
 - **Request**: `{"minutes": <int>}`. Must be a positive multiple of `tick_minutes` (15 min).
 - **Response**: `200 OK`
   ```json
@@ -64,7 +64,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
   - `409 Conflict` (`finished`): When `sim_minute >= end_minute` (scenario has ended).
 
 ### 1.4 `GET /events/chunks`
-- **Citation**: [docs/SIMULATOR.md §6](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L157-L161)
+- **Citation**: [docs/SIMULATOR.md §6](SIMULATOR.md#L157-L161)
 - **Query Params**:
   - `kind`: `"events"` (default) or `"history"`.
   - `after`: `<int>` (default `-1`). Returns chunks with `chunk > after`.
@@ -72,20 +72,20 @@ No authentication headers are required. All JSON payloads are standard `applicat
 - **Credit Cost**: 0.
 
 ### 1.5 `GET /events/chunks/{n}`
-- **Citation**: [docs/SIMULATOR.md §6](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L157-L160)
+- **Citation**: [docs/SIMULATOR.md §6](SIMULATOR.md#L157-L160)
 - **Request**: `n` (chunk index integer).
 - **Response**: `200 OK`, media-type `application/x-ndjson`. Stream of JSON objects separated by `\n`.
 - **Credit Cost**: 0.
 - **Error Codes**: `404 Not Found` if chunk `n` does not exist.
 
 ### 1.6 `GET /workflows`
-- **Citation**: [docs/SIMULATOR.md §2, §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L31-L35)
+- **Citation**: [docs/SIMULATOR.md §2, §7](SIMULATOR.md#L31-L35)
 - **Request**: None.
 - **Response**: `200 OK` `list[WorkflowPublic]`.
 - **Credit Cost**: 0.
 
 ### 1.7 `GET /workflows/{wid}`
-- **Citation**: [docs/SIMULATOR.md §2, §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L31-L35)
+- **Citation**: [docs/SIMULATOR.md §2, §7](SIMULATOR.md#L31-L35)
 - **Response**: `200 OK`
   ```json
   {
@@ -130,7 +130,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 - **Error Codes**: `404 Not Found` (`unknown_workflow`).
 
 ### 1.8 `GET /workflows/{wid}/config`
-- **Citation**: [docs/SIMULATOR.md §3, §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L49-L87)
+- **Citation**: [docs/SIMULATOR.md §3, §7](SIMULATOR.md#L49-L87)
 - **Response**: `200 OK`
   ```json
   {
@@ -159,12 +159,12 @@ No authentication headers are required. All JSON payloads are standard `applicat
 - **Error Codes**: `404 Not Found`.
 
 ### 1.9 `GET /workflows/{wid}/config/history`
-- **Citation**: [docs/SIMULATOR.md §7](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L181-L184)
+- **Citation**: [docs/SIMULATOR.md §7](SIMULATOR.md#L181-L184)
 - **Response**: `200 OK` `list[ConfigHistoryEntry]` showing `version`, `actor`, `changed_dims`, `applied_at`, `proposal_id`, `approval_id`.
 - **Credit Cost**: 0.
 
 ### 1.10 `PUT /workflows/{wid}/config` (Auto-apply)
-- **Citation**: [docs/SIMULATOR.md §4.2](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L140-L146)
+- **Citation**: [docs/SIMULATOR.md §4.2](SIMULATOR.md#L140-L146)
 - **Request Body**:
   ```json
   {
@@ -184,7 +184,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
   - `422 Unprocessable Entity` (`invalid_config`): Schema validation errors.
 
 ### 1.11 `POST /approvals` (Submit Proposal)
-- **Citation**: [docs/SIMULATOR.md §4.1](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L99-L127)
+- **Citation**: [docs/SIMULATOR.md §4.1](SIMULATOR.md#L99-L127)
 - **Request Body**:
   ```json
   {
@@ -224,13 +224,13 @@ No authentication headers are required. All JSON payloads are standard `applicat
   - `422 Unprocessable Entity` (`invalid_config`): Bad config structure or disallowed options.
 
 ### 1.12 `GET /approvals`
-- **Citation**: [docs/SIMULATOR.md §4.1](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L136-L137)
+- **Citation**: [docs/SIMULATOR.md §4.1](SIMULATOR.md#L136-L137)
 - **Query Params**: `workflow_id` (optional), `status` (optional).
 - **Response**: `200 OK` `list[ApprovalPublic]`.
 - **Credit Cost**: 0.
 
 ### 1.13 `GET /approvals/{aid}`
-- **Citation**: [docs/SIMULATOR.md §4.1](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L136-L137)
+- **Citation**: [docs/SIMULATOR.md §4.1](SIMULATOR.md#L136-L137)
 - **Response**: `200 OK`
   ```json
   {
@@ -251,7 +251,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 - **Error Codes**: `404 Not Found` (`not_found`).
 
 ### 1.14 `POST /workflows/{wid}/apply`
-- **Citation**: [docs/SIMULATOR.md §4.1](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L133-L135)
+- **Citation**: [docs/SIMULATOR.md §4.1](SIMULATOR.md#L133-L135)
 - **Request Body**: `{"approval_id": "apr_00001"}`
 - **Response**: `200 OK` `{"workflow_id": "nw_renewal", "version": 2, "changed_dims": ["voice"]}`
 - **Credit Cost**: 0.
@@ -262,7 +262,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
   - `409 Conflict` (`stale_base_version`): If workflow current version changed after proposal creation.
 
 ### 1.15 `POST /llm/suggest-fixes`
-- **Citation**: [docs/SIMULATOR.md §5](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L151-L153)
+- **Citation**: [docs/SIMULATOR.md §5](SIMULATOR.md#L151-L153)
 - **Request Body**: `{"workflow_id": "nw_renewal", "problem": "hallucination spike"}`
 - **Response**: `200 OK`
   ```json
@@ -280,7 +280,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
   - `422 Unprocessable Entity` (`missing_fields`): Missing or empty `problem`.
 
 ### 1.16 `POST /validation/runs`
-- **Citation**: [docs/SIMULATOR.md §5](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L154-L155)
+- **Citation**: [docs/SIMULATOR.md §5](SIMULATOR.md#L154-L155)
 - **Request Body**: `{"workflow_id": "nw_renewal", "prompt_version": "P3", "n": 200}`
   - Note: `n` must be integer in `[50, 2000]`.
 - **Response**: `200 OK`
@@ -307,7 +307,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 ## 2. Event Stream Contract
 
 ### 2.1 Event Types and Schemas
-- **Citation**: [docs/SIMULATOR.md §6](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L157-L180)
+- **Citation**: [docs/SIMULATOR.md §6](SIMULATOR.md#L157-L180)
 
 1. `campaign_created`:
    `{"type": "campaign_created", "ts": "...", "tenant_id": "...", "workflow_id": "...", "campaign_id": "nw_renewal:c0001", "leads": 1100, "config_version_at_creation": 1, "event_id": 1}`
@@ -339,7 +339,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 
 ## 3. Workflow Config Surface: Mutable vs Off-Limits
 
-- **Citation**: [docs/SIMULATOR.md §2, §3](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L31-L86), [README.md §5](file:///E:/Coding/diwali%20day%20hustle/README.md#L99-L100)
+- **Citation**: [docs/SIMULATOR.md §2, §3](SIMULATOR.md#L31-L86), [README.md §5](\.\./README.md#L99-L100)
 
 ### 3.1 Mutable Fields (Under Controller Governance)
 1. `cohorts`: List of up to 20 cohorts evaluated in order. Each cohort has `id` and `where` (AND across features, OR within feature list). Features: `lang`, `city_tier`, `age_band`, `value_band`.
@@ -349,7 +349,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 5. `schedule.lead_preferred_hour`: Map of `person_id` to preferred hour (int within dialling window). Multiplies lead weight by 6 in that hour and 0.25 in other hours. Capped at 200,000 entries.
 
 ### 3.2 Strictly Off-Limits Fields (Business-Owned)
-- **Citation**: [README.md §5 Constraint 2](file:///E:/Coding/diwali%20day%20hustle/README.md#L99-L100)
+- **Citation**: [README.md §5 Constraint 2](\.\./README.md#L99-L100)
 - `cadence`: `[attempts_per_day, ...]` (e.g. `[2, 3, 3]`).
 - `dialling_window`: `[start_hour, end_hour]` (e.g. `[9, 21]`).
 - `dials_per_hour` (dialler capacity).
@@ -360,7 +360,7 @@ No authentication headers are required. All JSON payloads are standard `applicat
 
 ## 4. Per-Workflow Governance Policy Object
 
-- **Citation**: [docs/SIMULATOR.md §4](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L88-L146)
+- **Citation**: [docs/SIMULATOR.md §4](SIMULATOR.md#L88-L146)
 Each workflow defines `governance`:
 - `auto_apply`:
   - `enabled`: `boolean`
@@ -420,7 +420,7 @@ Each workflow defines `governance`:
 
 ## 6. Credit Model
 
-- **Citation**: [docs/SIMULATOR.md §5](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L147-L156)
+- **Citation**: [docs/SIMULATOR.md §5](SIMULATOR.md#L147-L156)
 - Budget is per-scenario run (visible in `GET /sim/state` `credits_remaining`).
 - Credits do NOT refill automatically unless configured.
 - Costs:
@@ -433,7 +433,7 @@ Each workflow defines `governance`:
 
 ## 7. Hidden Ground Truth (What the API Does NOT Expose)
 
-- **Citation**: [README.md §5 Rule 1](file:///E:/Coding/diwali%20day%20hustle/README.md#L84-L87), [docs/SIMULATOR.md §0](file:///E:/Coding/diwali%20day%20hustle/docs/SIMULATOR.md#L4-L6)
+- **Citation**: [README.md §5 Rule 1](\.\./README.md#L84-L87), [docs/SIMULATOR.md §0](SIMULATOR.md#L4-L6)
 The API strictly does NOT expose:
 - `base_pickup` and `base_engage` parameters.
 - `did_base_health` or true DID spam reputation levels.

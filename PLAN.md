@@ -38,7 +38,7 @@ This plan establishes the architecture, data schemas, statistical framework, and
 
 | Memo | Stakeholder Claim | Reality & Policy Evidence | Action / Pushback |
 |---|---|---|---|
-| **01 (Sales)** | Blended score for easy viewing | Forbidden by [README.md §5 Constraint 3](file:///E:/Coding/diwali%20day%20hustle/README.md#L101-L102). Primary and Guardrail KPIs must remain separate. | Refuse to blend. Report primary KPI lift with guardrail margin. |
+| **01 (Sales)** | Blended score for easy viewing | Forbidden by [README.md §5 Constraint 3](README.md#L101-L102). Primary and Guardrail KPIs must remain separate. | Refuse to blend. Report primary KPI lift with guardrail margin. |
 | **01 (Sales)** | Promote winners by evening based on lunch data | Violates minimum sample size, power constraints, and introduces time-of-day bias. | Require fixed horizon tests with full day / multi-day sample sizes. |
 | **01 (Sales)** | Auto-apply everything on Kestrel (`ks_cancel`) | Policy sets `auto_apply.allowed_dims: [schedule, caller_id, welcome_message, voice]` and `max_shift: 0.2`. `prompt_version` and `cohorts` are prohibited; shifts > 0.2 fail with HTTP 403. | Use auto-apply only within allowed dims and $\le 20\%$ shift; route prompt/cohort changes through `/approvals`. |
 | **01 (Sales)** | Auto-apply on Northwind KYC (`nw_kyc`) | Policy sets `auto_apply.enabled: false`. Auto-apply calls return HTTP 403. | All KYC changes routed through human approval. |
