@@ -106,15 +106,15 @@ Credits used: 0 · validation runs: 0 · LLM fix calls: 0
 | Metric | Measured Value | Target / SLA | Notes |
 |---|---|---|---|
 | **Total Events Ingested** | 4,200,117 | ~3,200,000 | 12 workflows across 5 simulated days |
-| **Total Ingest Duration** | 153.52 s | < 300 s | 30.70 s / simulated day |
-| **Overall Ingest Rate** | **27,358.7 events/s** | > 10,000 events/s | Peak streaming throughput |
-| **Peak Controller RSS** | **124.05 MB** | < 300 MB | Strictly bounded $O(1)$ memory |
+| **Total Ingest Duration** | 119.34 s | < 300 s | 23.87 s / simulated day |
+| **Overall Ingest Rate** | **35,193.9 events/s** | > 10,000 events/s | Peak streaming throughput |
+| **Peak Controller RSS** | **124.45 MB** | < 300 MB | Strictly bounded $O(1)$ memory |
 | **Decision Lag** | **0 ticks** | 0 ticks | Zero backlog / zero lag ticks |
 | **SQLite Database Size** | **152.11 MB** | < 500 MB | Clean WAL storage with 2-day pruning |
-| **Mean Cycle Wall-Clock** | **319.0 ms** | < 1,000 ms | Ingest + detection + governance per tick |
-| **p50 Cycle Wall-Clock** | **425.4 ms** | < 500 ms | Median tick execution time |
-| **p95 Cycle Wall-Clock** | **581.8 ms** | < 2,000 ms | Peak chunk ingestion tick |
-| **Max Cycle Wall-Clock** | **5500.3 ms** | < 5,000 ms | Heaviest hourly roll-up tick |
+| **Mean Cycle Wall-Clock** | **247.8 ms** | < 1,000 ms | Ingest + detection + governance per tick |
+| **p50 Cycle Wall-Clock** | **324.5 ms** | < 500 ms | Median tick execution time |
+| **p95 Cycle Wall-Clock** | **457.2 ms** | < 2,000 ms | Peak chunk ingestion tick |
+| **Max Cycle Wall-Clock** | **4272.9 ms** | < 5,000 ms | Heaviest hourly roll-up tick |
 
 ### Database Row Counts
 

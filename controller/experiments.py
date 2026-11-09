@@ -686,7 +686,13 @@ class ExperimentManager:
             return False
         else:
             # Inconclusive, guardrail vetoed, or no arm beat control: restore 100% control arm
-            final_status = "INCONCLUSIVE" if (getattr(exp, "mde", 0.08) > 0.20) else "NO_EFFECT"
+            any_vetoed = any(r.get("is_vetoed", False) for r in treatment_results)
+            if any_vetoed:
+                final_status = "VETOED"
+            elif getattr(exp, "mde", 0.08) > 0.20:
+                final_status = "INCONCLUSIVE"
+            else:
+                final_status = "NO_EFFECT"
             self._close_experiment(exp, final_status, None, sim_minute)
             cur_cfg_resp = self.governance.api.get_config(wid)
             cur_cfg = cur_cfg_resp["config"]
@@ -915,12 +921,12 @@ class ExperimentManager:
         self._active_experiments.pop(exp.workflow_id, None)
 
         # Candidate retirement: permanently retire inferior/no-effect candidates
-        if status in ("NO_EFFECT", "INCONCLUSIVE", "TIMED_OUT"):
+        if status in ("NO_EFFECT", "INCONCLUSIVE", "TIMED_OUT", "VETOED"):
             for t in [a for a in exp.arms if a != exp.control_arm]:
                 self.store.retire_candidate(exp.workflow_id, exp.dim, t, sim_minute, status)
 
         # Post-experiment cooldown: prevent relaunch on same (workflow, dim) after NO_EFFECT/INCONCLUSIVE/INVALIDATED/HALTED/TIMED_OUT
-        if status in ("NO_EFFECT", "INCONCLUSIVE", "HALTED", "INVALIDATED", "TIMED_OUT"):
+        if status in ("NO_EFFECT", "INCONCLUSIVE", "HALTED", "INVALIDATED", "TIMED_OUT", "VETOED"):
             cooldown_days = 3
             cooldown_min = sim_minute + (cooldown_days * 1440)
             self.store.set_cooldown(exp.workflow_id, exp.dim, cooldown_min, status)

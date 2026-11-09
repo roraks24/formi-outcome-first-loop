@@ -253,7 +253,7 @@ The simulator counts all approval requests submitted within the trailing 24 hour
 - ks_cancel v9 (controller_auto) dims=['welcome_message'] engageΔ=+0.020 didΔ=+0.000 → beneficial
 - nw_renewal v7 (controller_approved) dims=['welcome_message'] engageΔ=-0.029 didΔ=+0.000 → harmful
 ```
-**Experiment Status Counts**: `{'NO_EFFECT': 8, 'PENDING_APPLY': 1}`.
+**Experiment Status Counts**: `{'INCONCLUSIVE': 7, 'PENDING_APPLY': 1, 'VETOED': 1}`.
 
 ---
 
@@ -291,7 +291,7 @@ The simulator counts all approval requests submitted within the trailing 24 hour
 - ks_cancel v10 (controller_auto) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → neutral
 - ks_cancel v11 (controller_auto) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → neutral
 ```
-**Experiment Status Counts**: `{'INVALIDATED': 2, 'NO_EFFECT': 6}`.
+**Experiment Status Counts**: `{'INCONCLUSIVE': 5, 'INVALIDATED': 2, 'VETOED': 1}`.
 
 ---
 
@@ -350,11 +350,11 @@ The simulator counts all approval requests submitted within the trailing 24 hour
 - horizon_intake v6 (controller_approved) dims=['prompt_version'] engageΔ=+0.120 didΔ=+0.000 → beneficial
 - apex_collections v5 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.796 → beneficial
 ```
-**Experiment Status Counts**: `{'INVALIDATED': 2, 'NO_EFFECT': 2}`.
+**Experiment Status Counts**: `{'INCONCLUSIVE': 1, 'INVALIDATED': 2, 'VETOED': 1}`.
 
 ---
 
 ## 9. Verification & Tagging
 - Pinned requirements (`numpy==1.26.4`, `scipy==1.13.1`, `PyYAML==6.0.2`, `fastapi==0.110.0`, `uvicorn==0.29.0`, `httpx==0.27.0`, `pytest==8.1.1`).
 - Clean clone in isolated environment passes `./run.sh` and grades identically against baseline.
-- Tagged at `freeze-v1.2`.
+- Tagged at `freeze-v1.3`.
